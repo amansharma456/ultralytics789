@@ -1952,12 +1952,25 @@ def parse_model(d, ch, verbose=True):
             c1 = ch[f]
             args = [*args[1:]]
         else:
+            elif m is ConvNeXtV2Backbone:
+            # ConvNeXtV2Backbone takes (variant, in_chans, drop_path_rate)
+            # args in YAML: [variant_str, drop_path_rate]  (in_chans auto-filled below)
+            variant     = args[0] if len(args) > 0 else "tiny"
+            drop_path   = args[1] if len(args) > 1 else 0.0
+            args        = [variant, ch[f], drop_path]   # fill in_chans from ch
+            c2          = None    # placeholder; backbone outputs a list
+        else:
             c2 = ch[f]
 
         m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
         t = str(m)[8:-2].replace("__main__.", "")  # module type
         m_.np = sum(x.numel() for x in m_.parameters())  # number params
-        m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type
+        m_.i, m_.f, m_.type = i, f, t 
+    # record per-stage channel counts for multi-output backbones
+        if m is ConvNeXtV2Backbone:
+            multi_out_ch[i] = m_.dims      # e.g. [96, 192, 384, 768]
+            c2 = m_.dims[-1]               # ch list stores last stage width
+                                           # individual stages accessed via multi_out_ch# attach index, 'from' index, type
         if verbose:
             LOGGER.info(f"{i:>3}{f!s:>20}{n_:>3}{m_.np:10.0f}  {t:<45}{args!s:<30}")  # print
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
