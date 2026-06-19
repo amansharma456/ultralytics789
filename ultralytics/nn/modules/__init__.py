@@ -16,7 +16,7 @@ Examples:
     >>> torch.onnx.export(m, x, f)
     >>> subprocess.run(f"onnxslim {f} {f} && open {f}", shell=True, check=True)  # pip install onnxslim
 """
-
+from .convnextv2 import ConvNeXtV2Backbone
 from .block import (
     C1,
     C2,
@@ -109,6 +109,7 @@ from .transformer import (
 
 __all__ = (
     "AIFI",
+    "ConvNeXtV2Backbone",
     "C1",
     "C2",
     "C2PSA",
