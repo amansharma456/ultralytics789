@@ -1946,7 +1946,7 @@ def parse_model(d, ch, verbose=True):
             args = [c1, c2, *args[1:]]
         elif m is CBFuse:
             c2 = ch[f[-1]]
-       elif m in frozenset({TorchVision, Index}):
+        elif m in frozenset({TorchVision, Index}):
             if f in multi_out_ch:
                 # selecting one stage from a multi-output backbone
                 stage_idx = args[0]
@@ -1956,16 +1956,16 @@ def parse_model(d, ch, verbose=True):
                 c2 = args[0]
                 c1 = ch[f]
                 args = [*args[1:]]
-        else:
-            elif m is ConvNeXtV2Backbone:
-            # ConvNeXtV2Backbone takes (variant, in_chans, drop_path_rate)
-            # args in YAML: [variant_str, drop_path_rate]  (in_chans auto-filled below)
-            variant     = args[0] if len(args) > 0 else "tiny"
-            drop_path   = args[1] if len(args) > 1 else 0.0
-            args        = [variant, ch[f], drop_path]   # fill in_chans from ch
-            c2          = None    # placeholder; backbone outputs a list
-        else:
-            c2 = ch[f]
+            else:
+                elif m is ConvNeXtV2Backbone:
+                # ConvNeXtV2Backbone takes (variant, in_chans, drop_path_rate)
+                # args in YAML: [variant_str, drop_path_rate]  (in_chans auto-filled below)
+                variant     = args[0] if len(args) > 0 else "tiny"
+                drop_path   = args[1] if len(args) > 1 else 0.0
+                args        = [variant, ch[f], drop_path]   # fill in_chans from ch
+                c2          = None    # placeholder; backbone outputs a list
+            else:
+                c2 = ch[f]
 
         m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
         t = str(m)[8:-2].replace("__main__.", "")  # module type
