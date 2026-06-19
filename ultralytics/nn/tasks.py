@@ -6,9 +6,8 @@ import re
 import threading
 from copy import deepcopy
 from pathlib import Path
-from ultralytics.nn.modules import (
-    ...               # all the existing imports stay exactly as they are
-    ConvNeXtV2Backbone,   # ← add this one line
+from ultralytics.nn.modules import (              
+    ConvNeXtV2Backbone   
 )
 
 
