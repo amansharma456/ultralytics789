@@ -1763,21 +1763,9 @@ def load_checkpoint(weight, device=None, inplace=True, fuse=False):
 
 
 def parse_model(d, ch, verbose=True):
-    """Parse a YOLO model.yaml dictionary into a PyTorch model.
-
-    Args:
-        d (dict): Model dictionary.
-        ch (int): Input channels.
-        verbose (bool): Whether to print model details.
-
-    Returns:
-        (torch.nn.Sequential): PyTorch model.
-        (list): Sorted list of layer indices whose outputs need to be saved.
-    """
     import ast
 
-    # Args
-    legacy = True  # backward compatibility for v3/v5/v8/v9 models
+    legacy = True
     max_channels = float("inf")
     nc, act, scales, end2end = (d.get(x) for x in ("nc", "activation", "scales", "end2end"))
     reg_max = d.get("reg_max", 16)
@@ -1791,18 +1779,17 @@ def parse_model(d, ch, verbose=True):
 
     restricted = _SafeLoad.restricted()
     if act:
-        # redefine default activation, i.e. Conv.default_act = torch.nn.SiLU(). Under restricted loading, resolve the
-        # spec without eval() (see _SafeLoad.activation).
         Conv.default_act = _SafeLoad.activation(act) if restricted else eval(act)
         if verbose:
-            LOGGER.info(f"{colorstr('activation:')} {act}")  # print
+            LOGGER.info(f"{colorstr('activation:')} {act}")
 
     if verbose:
         LOGGER.info(f"\n{'':>3}{'from':>20}{'n':>3}{'params':>10}  {'module':<45}{'arguments':<30}")
+
     ch = [ch]
     layers, save, c2 = [], [], ch[-1]
-    # index → list-of-channels for multi-output layers (e.g. ConvNeXtV2Backbone)
-    multi_out_ch = {}   # {layer_index: [c_stage0, c_stage1, ...]}# layers, savelist, ch out
+    multi_out_ch = {}  # {layer_index: [c_stage0, c_stage1, c_stage2, c_stage3]}
+
     base_modules = frozenset(
         {
             Classify,
@@ -1841,7 +1828,7 @@ def parse_model(d, ch, verbose=True):
             A2C2f,
         }
     )
-    repeat_modules = frozenset(  # modules with 'repeat' arguments
+    repeat_modules = frozenset(
         {
             BottleneckCSP,
             C1,
@@ -1860,58 +1847,66 @@ def parse_model(d, ch, verbose=True):
             A2C2f,
         }
     )
-    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
+
+    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):
         m = (
             getattr(torch.nn, m[3:])
             if m.startswith("nn.")
             else getattr(__import__("torchvision").ops, m[16:])
             if m.startswith("torchvision.ops.")
             else globals()[m]
-        )  # get module
+        )
         if restricted and not (isinstance(m, type) and issubclass(m, torch.nn.Module)):
-            # Under restricted loading, only known model layers may be named here.
             raise TypeError(emojis(f"ERROR ❌️ module '{m}' is not a permitted model layer under restricted loading."))
+
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
+
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
+
         if m in base_modules:
             c1, c2 = ch[f], args[0]
-            if c2 != nc:  # if c2 != nc (e.g., Classify() output)
+            if c2 != nc:
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
-            if m is C2fAttn:  # set 1) embed channels and 2) num heads
+            if m is C2fAttn:
                 args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
                 args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
-
             args = [c1, c2, *args[1:]]
             if m in repeat_modules:
-                args.insert(2, n)  # number of repeats
+                args.insert(2, n)
                 n = 1
-            if m is C3k2:  # for M/L/X sizes
+            if m is C3k2:
                 legacy = False
                 if scale in "mlx":
                     args[3] = True
             if m is A2C2f:
                 legacy = False
-                if scale in "lx":  # for L/X sizes
+                if scale in "lx":
                     args.extend((True, 1.2))
             if m is C2fCIB:
                 legacy = False
+
         elif m is AIFI:
             args = [ch[f], *args]
+
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
             if m is HGBlock:
-                args.insert(4, n)  # number of repeats
+                args.insert(4, n)
                 n = 1
+
         elif m is ResNetLayer:
             c2 = args[1] if args[3] else args[1] * 4
+
         elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]
+
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+
         elif m in frozenset(
             {
                 Detect,
@@ -1932,57 +1927,69 @@ def parse_model(d, ch, verbose=True):
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
                 m.legacy = legacy
+
         elif m is SemanticSegment:
-            args.append([ch[x] for x in f])  # nc, ch tuple
+            args.append([ch[x] for x in f])
+
         elif m is v10Detect:
             args.append([ch[x] for x in f])
+
         elif m is ImagePoolingAttn:
-            args.insert(1, [ch[x] for x in f])  # channels as second arg
-        elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
+
+        elif m is RTDETRDecoder:
+            args.insert(1, [ch[x] for x in f])
+
         elif m is CBLinear:
             c2 = args[0]
             c1 = ch[f]
             args = [c1, c2, *args[1:]]
+
         elif m is CBFuse:
             c2 = ch[f[-1]]
-        elif m in frozenset({TorchVision, Index}):
-            if f in multi_out_ch:
-                # selecting one stage from a multi-output backbone
-                stage_idx = args[0]
-                c2 = multi_out_ch[f][stage_idx]
-                args = [stage_idx]
-            else:
-                c2 = args[0]
-                c1 = ch[f]
-                args = [*args[1:]]
-            else:
-                elif m is ConvNeXtV2Backbone:
-                # ConvNeXtV2Backbone takes (variant, in_chans, drop_path_rate)
-                # args in YAML: [variant_str, drop_path_rate]  (in_chans auto-filled below)
-                variant     = args[0] if len(args) > 0 else "tiny"
-                drop_path   = args[1] if len(args) > 1 else 0.0
-                args        = [variant, ch[f], drop_path]   # fill in_chans from ch
-                c2          = None    # placeholder; backbone outputs a list
-            else:
-                c2 = ch[f]
 
-        m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
-        t = str(m)[8:-2].replace("__main__.", "")  # module type
-        m_.np = sum(x.numel() for x in m_.parameters())  # number params
-        m_.i, m_.f, m_.type = i, f, t 
-    # record per-stage channel counts for multi-output backbones
+        elif m is ConvNeXtV2Backbone:
+            # args in YAML: ["tiny", 0.1]  → variant, drop_path_rate
+            # in_chans is filled automatically from ch[f]
+            variant   = args[0] if len(args) > 0 else "tiny"
+            drop_path = args[1] if len(args) > 1 else 0.0
+            args      = [variant, ch[f], drop_path]
+            c2        = None  # multi-output; real channels stored in multi_out_ch below
+
+        elif m in frozenset({TorchVision, Index}):
+            if isinstance(f, int) and f in multi_out_ch:
+                # Selecting one stage tensor from a ConvNeXtV2Backbone output list
+                stage_idx = args[0]
+                c2        = multi_out_ch[f][stage_idx]
+                args      = [stage_idx]
+            else:
+                c2   = args[0]
+                c1   = ch[f]
+                args = [*args[1:]]
+
+        else:
+            c2 = ch[f]
+
+        m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)
+        t = str(m)[8:-2].replace("__main__.", "")
+        m_.np = sum(x.numel() for x in m_.parameters())
+        m_.i, m_.f, m_.type = i, f, t
+
+        # After building the module, record multi-output channels and fix c2
         if m is ConvNeXtV2Backbone:
-            multi_out_ch[i] = m_.dims      # e.g. [96, 192, 384, 768]
-            c2 = m_.dims[-1]               # ch list stores last stage width
-                                           # individual stages accessed via multi_out_ch# attach index, 'from' index, type
+            multi_out_ch[i] = list(m_.dims)   # e.g. [96, 192, 384, 768] for tiny
+            c2 = m_.dims[-1]                  # ch list carries the last-stage width;
+                                              # individual stage widths live in multi_out_ch
+
         if verbose:
-            LOGGER.info(f"{i:>3}{f!s:>20}{n_:>3}{m_.np:10.0f}  {t:<45}{args!s:<30}")  # print
-        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+            LOGGER.info(f"{i:>3}{f!s:>20}{n_:>3}{m_.np:10.0f}  {t:<45}{args!s:<30}")
+
+        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
         layers.append(m_)
         if i == 0:
             ch = []
         ch.append(c2)
+
     return torch.nn.Sequential(*layers), sorted(save)
 
 
