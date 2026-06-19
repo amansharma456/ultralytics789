@@ -1,0 +1,43 @@
+# YOLOv8 + ConvNeXtV2-Tiny backbone
+# Channels: P2=96  P3=192  P4=384  P5=768
+
+nc: 1        # tuberculosis bacilli
+scales:
+  n: [0.33, 0.25, 1024]
+  s: [0.33, 0.50, 1024]
+  m: [0.67, 0.75,  768]
+  l: [1.00, 1.00,  512]
+  x: [1.00, 1.25,  512]
+
+backbone:
+  # [from, repeats, module,             args]
+  # Layer 0: run the full ConvNeXtV2 backbone → caches [P2,P3,P4,P5] in y[0]
+  - [-1, 1, ConvNeXtV2Backbone,  ["tiny", 0.1]]
+
+  # Layers 1-3: pull individual stages out of the cached list using Index
+  # Index(i) selects element i from a list tensor
+  - [0,  1, Index,               [1]]   # layer 1 → P3  192ch  stride 8
+  - [0,  1, Index,               [2]]   # layer 2 → P4  384ch  stride 16
+  - [0,  1, Index,               [3]]   # layer 3 → P5  768ch  stride 32
+
+head:
+  # ── top-down path ───────────────────────────────────────────────────────
+  - [-1,  1, nn.Upsample,        [null, 2, "nearest"]]   # 4: upsample P5
+  - [[2, -1], 1, Concat,         [1]]                    # 5: cat P4 + up(P5) = 576ch
+  - [-1,  3, C2f,                [384]]                  # 6
+
+  - [-1,  1, nn.Upsample,        [null, 2, "nearest"]]   # 7: upsample
+  - [[1, -1], 1, Concat,         [1]]                    # 8: cat P3 + up = 576ch
+  - [-1,  3, C2f,                [192]]                  # 9  ← P3_out  (small)
+
+  # ── bottom-up path ──────────────────────────────────────────────────────
+  - [-1,  1, Conv,               [192, 3, 2]]            # 10: stride-2
+  - [[6, -1], 1, Concat,         [1]]                    # 11: cat neck-P4
+  - [-1,  3, C2f,                [384]]                  # 12 ← P4_out  (medium)
+
+  - [-1,  1, Conv,               [384, 3, 2]]            # 13: stride-2
+  - [[3, -1], 1, Concat,         [1]]                    # 14: cat P5
+  - [-1,  3, C2f,                [768]]                  # 15 ← P5_out  (large)
+
+  # ── detection head ──────────────────────────────────────────────────────
+  - [[9, 12, 15], 1, Detect,     [nc]]                   # 16: Detect P3/P4/P5
