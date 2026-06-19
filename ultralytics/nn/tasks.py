@@ -1801,7 +1801,9 @@ def parse_model(d, ch, verbose=True):
     if verbose:
         LOGGER.info(f"\n{'':>3}{'from':>20}{'n':>3}{'params':>10}  {'module':<45}{'arguments':<30}")
     ch = [ch]
-    layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    layers, save, c2 = [], [], ch[-1]
+    # index → list-of-channels for multi-output layers (e.g. ConvNeXtV2Backbone)
+    multi_out_ch = {}   # {layer_index: [c_stage0, c_stage1, ...]}# layers, savelist, ch out
     base_modules = frozenset(
         {
             Classify,
