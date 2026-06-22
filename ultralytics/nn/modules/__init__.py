@@ -109,7 +109,7 @@ from .transformer import (
 
 __all__ = (
     "AIFI",
-    "ConvNeXtV2Backbone",
+    "FNOBackbone",
     "C1",
     "C2",
     "C2PSA",
