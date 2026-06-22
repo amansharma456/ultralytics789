@@ -7,7 +7,7 @@ import threading
 from copy import deepcopy
 from pathlib import Path
 from ultralytics.nn.modules import (              
-        ConvNeXtV2Backbone  
+        ConvNeXtV2Backbone, FNOBackbone  
 )
 
 
@@ -1947,7 +1947,11 @@ def parse_model(d, ch, verbose=True):
 
         elif m is CBFuse:
             c2 = ch[f[-1]]
-
+        elif m is FNOBackbone:
+            # YAML args are empty []; in_chans is injected automatically from ch[f].
+            # dims and modes use the class defaults (optimum values baked in).
+            args = [ch[f]]   # FNOBackbone(in_chans)
+            c2   = None      # multi-output; real per-stage channels stored below
         elif m is ConvNeXtV2Backbone:
             # args in YAML: ["tiny", 0.1]  → variant, drop_path_rate
             # in_chans is filled automatically from ch[f]
@@ -1974,6 +1978,10 @@ def parse_model(d, ch, verbose=True):
         t = str(m)[8:-2].replace("__main__.", "")
         m_.np = sum(x.numel() for x in m_.parameters())
         m_.i, m_.f, m_.type = i, f, t
+        if m is FNOBackbone:
+            multi_out_ch[i] = list(m_.dims)   # e.g. [96, 192, 384, 768]
+            c2 = m_.dims[-1]                  # ch[] carries deepest-stage width;
+                                              # individual widths live in multi_out_ch
 
         # After building the module, record multi-output channels and fix c2
         if m is ConvNeXtV2Backbone:
