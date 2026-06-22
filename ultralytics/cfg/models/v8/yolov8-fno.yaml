@@ -1,7 +1,7 @@
 # YOLOv8 + FNO Backbone — TB Bacilli Detection
 # Backbone : 4-block FNO  [96, 192, 384, 768]  modes [20, 16, 12, 8]
 # Neck     : YOLOv8 PAN-FPN (unchanged from stock)
-# Head     : YOLOv8 Detect
+# Head     : YOLOv8 Detect 
 
 nc: 1
 scales:
