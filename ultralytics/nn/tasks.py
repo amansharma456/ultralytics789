@@ -7,7 +7,7 @@ import threading
 from copy import deepcopy
 from pathlib import Path
 from ultralytics.nn.modules import (              
-    ConvNeXtV2Backbone   
+        FNOBackbone  
 )
 
 
@@ -1788,7 +1788,9 @@ def parse_model(d, ch, verbose=True):
 
     ch = [ch]
     layers, save, c2 = [], [], ch[-1]
-    multi_out_ch = {}  # {layer_index: [c_stage0, c_stage1, c_stage2, c_stage3]}
+    # Stores per-stage channel counts for backbones that return a list of tensors.
+    # Key = layer index of the backbone,  Value = [c_P2, c_P3, c_P4, c_P5]
+    multi_out_ch = {}
 
     base_modules = frozenset(
         {
@@ -1864,7 +1866,7 @@ def parse_model(d, ch, verbose=True):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
 
-        n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
+        n = n_ = max(round(n * depth), 1) if n > 1 else n
 
         if m in base_modules:
             c1, c2 = ch[f], args[0]
@@ -1948,17 +1950,16 @@ def parse_model(d, ch, verbose=True):
         elif m is CBFuse:
             c2 = ch[f[-1]]
 
-        elif m is ConvNeXtV2Backbone:
-            # args in YAML: ["tiny", 0.1]  → variant, drop_path_rate
-            # in_chans is filled automatically from ch[f]
-            variant   = args[0] if len(args) > 0 else "tiny"
-            drop_path = args[1] if len(args) > 1 else 0.0
-            args      = [variant, ch[f], drop_path]
-            c2        = None  # multi-output; real channels stored in multi_out_ch below
+        elif m is FNOBackbone:
+            # YAML args are empty []; in_chans is injected automatically from ch[f].
+            # dims and modes use the class defaults (optimum values baked in).
+            args = [ch[f]]   # FNOBackbone(in_chans)
+            c2   = None      # multi-output; real per-stage channels stored below
 
         elif m in frozenset({TorchVision, Index}):
             if isinstance(f, int) and f in multi_out_ch:
-                # Selecting one stage tensor from a ConvNeXtV2Backbone output list
+                # Selecting one stage tensor from FNOBackbone's list output.
+                # args[0] is the stage index (0=P2, 1=P3, 2=P4, 3=P5).
                 stage_idx = args[0]
                 c2        = multi_out_ch[f][stage_idx]
                 args      = [stage_idx]
@@ -1975,11 +1976,11 @@ def parse_model(d, ch, verbose=True):
         m_.np = sum(x.numel() for x in m_.parameters())
         m_.i, m_.f, m_.type = i, f, t
 
-        # After building the module, record multi-output channels and fix c2
-        if m is ConvNeXtV2Backbone:
-            multi_out_ch[i] = list(m_.dims)   # e.g. [96, 192, 384, 768] for tiny
-            c2 = m_.dims[-1]                  # ch list carries the last-stage width;
-                                              # individual stage widths live in multi_out_ch
+        # After instantiation, record multi-stage channel list and fix c2
+        if m is FNOBackbone:
+            multi_out_ch[i] = list(m_.dims)   # e.g. [96, 192, 384, 768]
+            c2 = m_.dims[-1]                  # ch[] carries deepest-stage width;
+                                              # individual widths live in multi_out_ch
 
         if verbose:
             LOGGER.info(f"{i:>3}{f!s:>20}{n_:>3}{m_.np:10.0f}  {t:<45}{args!s:<30}")
@@ -1991,7 +1992,6 @@ def parse_model(d, ch, verbose=True):
         ch.append(c2)
 
     return torch.nn.Sequential(*layers), sorted(save)
-
 
 def yaml_model_load(path):
     """Load a YOLO model from a YAML file.
