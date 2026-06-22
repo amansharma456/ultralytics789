@@ -1,5 +1,5 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-
+from .fno_backbone import FNOBackbone
 from .tasks import (
     BaseModel,
     ClassificationModel,
