@@ -7,7 +7,7 @@ import threading
 from copy import deepcopy
 from pathlib import Path
 from ultralytics.nn.modules import (              
-        FNOBackbone  
+        ConvNeXtV2Backbone  
 )
 
 
