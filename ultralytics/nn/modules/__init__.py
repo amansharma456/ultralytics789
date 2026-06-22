@@ -17,6 +17,7 @@ Examples:
     >>> subprocess.run(f"onnxslim {f} {f} && open {f}", shell=True, check=True)  # pip install onnxslim
 """
 from .convnextv2 import ConvNeXtV2Backbone
+from .fno_backbone import FNOBackbone
 from .block import (
     C1,
     C2,
