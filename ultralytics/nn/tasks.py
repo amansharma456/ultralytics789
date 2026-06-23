@@ -658,7 +658,147 @@ class SemanticSegmentationModel(BaseModel):
         if isinstance(m, SemanticSegment):
             m.stride = fn(m.stride)
         return self
+# ──────────────────────────────────────────────────────────────────────────────
+# Dual-head loss
+# ──────────────────────────────────────────────────────────────────────────────
 
+class DualDetectionLoss:
+    """
+    Wraps v8DetectionLoss for two Detect heads.
+
+    During training DualDetectionModel._predict_once returns
+        [head1_features, head2_features]
+    This class splits them, computes a loss for each head, and sums with weights.
+
+    Primary weight = 1.0, auxiliary weight = 0.4 (standard deep-supervision ratio).
+    The only difference between the two loss instances is self.stride — everything
+    else (nc, no, reg_max, BboxLoss, TaskAlignedAssigner) is shared via shallow copy.
+    """
+
+    def __init__(self, model, primary_weight=1.0, auxiliary_weight=0.4):
+        from ultralytics.utils.loss import v8DetectionLoss
+        import copy
+
+        # Collect both Detect layers in forward order
+        detect_layers = [m for m in model.model if isinstance(m, Detect)]
+        if len(detect_layers) != 2:
+            raise ValueError(
+                f"DualDetectionLoss expects exactly 2 Detect layers, found {len(detect_layers)}"
+            )
+        head1, head2 = detect_layers
+
+        # v8DetectionLoss always reads model.model[-1] for its parameters.
+        # model[-1] is Head-2 (last layer), so base_loss is already correct for Head-2.
+        self.loss2 = v8DetectionLoss(model)
+
+        # Shallow-copy for Head-1: everything is identical except stride.
+        self.loss1 = copy.copy(self.loss2)
+        self.loss1.stride = head1.stride   # override stride to [8, 16, 32]
+        # self.loss2.stride already = head2.stride = [4, 8, 16] from init
+
+        self.pw = primary_weight
+        self.aw = auxiliary_weight
+
+    def __call__(self, preds, batch):
+        # preds = [head1_feature_list, head2_feature_list]
+        l1, items1 = self.loss1(preds[0], batch)
+        l2, items2 = self.loss2(preds[1], batch)
+        total = self.pw * l1 + self.aw * l2
+        return total, (self.pw * items1 + self.aw * items2).detach()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dual-head detection model
+# ──────────────────────────────────────────────────────────────────────────────
+
+class DualDetectionModel(BaseModel):
+    """
+    YOLOv8-style model with two Detect heads.
+
+    Inherits BaseModel (not DetectionModel) so we can control stride
+    computation for both heads independently without fighting
+    DetectionModel.__init__'s assumption that model[-1] is the only head.
+
+    Head-1 (primary)   — P3/P4/P5,   strides [8,  16, 32]
+    Head-2 (auxiliary) — P2/P3/P4,   strides [4,  8,  16]
+
+    Training  forward → list [head1_feats, head2_feats]
+    Inference forward → head1 decoded output  (primary head only)
+    """
+
+    def __init__(self, cfg="yolov8-fno-dual.yaml", ch=3, nc=None, verbose=True):
+        super().__init__()                                # nn.Module.__init__
+        _initialize_yolo_model(self, cfg, ch, nc, verbose)
+
+        # Locate both Detect layers in sequential order
+        detect_layers = [m for m in self.model if isinstance(m, Detect)]
+        if len(detect_layers) != 2:
+            raise ValueError(
+                f"DualDetectionModel requires exactly 2 Detect layers in the YAML, "
+                f"found {len(detect_layers)}"
+            )
+        self.head1 = detect_layers[0]   # layer 16, primary
+        self.head2 = detect_layers[1]   # layer 19, auxiliary
+
+        self.head1.inplace = self.inplace
+        self.head2.inplace = self.inplace
+
+        # ── compute strides for both heads ────────────────────────────────
+        # Put model in eval but keep both Detect layers in train mode so they
+        # return raw feature lists (not decoded inference tensors).
+        s = 256
+        self.model.eval()
+        self.head1.training = True
+        self.head2.training = True
+
+        with torch.no_grad():
+            raw = self._predict_once(torch.zeros(1, ch, s, s))
+        # raw = [head1_feat_list, head2_feat_list]
+        # Each feat_list element is (1, no, H, W); stride = s / H
+        self.head1.stride = torch.tensor([s / x.shape[-2] for x in raw[0]])
+        self.head2.stride = torch.tensor([s / x.shape[-2] for x in raw[1]])
+        self.stride = self.head1.stride   # Ultralytics Trainer reads model.stride
+
+        self.model.train()
+        self.head1.bias_init()
+        self.head2.bias_init()
+
+        initialize_weights(self)
+        if verbose:
+            self.info()
+            LOGGER.info("")
+
+    # ------------------------------------------------------------------
+    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+        y = []
+        detect_outputs = []
+
+        for m in self.model:
+            if m.f != -1:
+                x = (
+                    y[m.f]
+                    if isinstance(m.f, int)
+                    else [x if j == -1 else y[j] for j in m.f]
+                )
+            x = m(x)
+            if isinstance(m, Detect):
+                detect_outputs.append(x)
+            y.append(x if m.i in self.save else None)
+
+        if self.training:
+            # Each element is the raw feature list from one Detect layer
+            return detect_outputs               # [head1_feats, head2_feats]
+        # Inference: return only the primary head's decoded tensor
+        return detect_outputs[0]
+
+    # ------------------------------------------------------------------
+    def init_criterion(self):
+        return DualDetectionLoss(self)
+
+    # ------------------------------------------------------------------
+    @property
+    def end2end(self):
+        return False
 
 class PoseModel(DetectionModel):
     """YOLO pose model.
