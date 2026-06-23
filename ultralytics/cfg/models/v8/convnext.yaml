@@ -41,3 +41,7 @@ head:
 
   # ── detection head ──────────────────────────────────────────────────────
   - [[9, 12, 15], 1, Detect,     [nc]]                   # 16: Detect P3/P4/P5
+    # ── second head: operates at finer scales [4, 8, 16] ─────────────────
+  - [0,  1, Index,        [0]]      # 17  P2   96ch  stride 4  (from backbone cache)
+  - [-1, 1, Conv,         [96, 3, 1]]             # 18  P2 refined  96ch
+  - [[18, 9, 12], 1, Detect, [nc]]               # 19  Head-2  strides [4, 8, 16]
