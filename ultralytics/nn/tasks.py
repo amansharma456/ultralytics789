@@ -2093,6 +2093,10 @@ def parse_model(d, ch, verbose=True):
             # dims and modes use the class defaults (optimum values baked in).
             args = [ch[f]]   # FNOBackbone(in_chans)
             c2   = None      # multi-output; real per-stage channels stored below
+        elif m is ECA:
+            # ECA takes only the channel count; reads it from ch[f]
+            c2   = ch[f]
+            args = [ch[f]]    # ECA(channels)        
         elif m is ConvNeXtV2Backbone:
             # args in YAML: ["tiny", 0.1]  → variant, drop_path_rate
             # in_chans is filled automatically from ch[f]
