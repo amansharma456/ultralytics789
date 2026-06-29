@@ -1,151 +1,215 @@
+"""
+FNO Backbone for YOLOv8 — TB Bacilli Detection
+Improvements over v1:
+  - 3x3 depthwise conv bypass (was 1x1) for local texture
+  - ECA (Efficient Channel Attention) after every FNO block
+  - SPPF at P5 to capture multi-scale global context
+  - Stem uses two 3x3 convs instead of one 4x4 (less aliasing)
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 
+# ── ECA: Efficient Channel Attention ────────────────────────────────────────
+class ECA(nn.Module):
+    """
+    Efficient Channel Attention (Wang et al., 2020).
+    Adaptive kernel size k is computed from channel count C so the
+    module is parameter-efficient and generalises across widths.
+    No FC layers — just a 1D conv over the channel vector.
+    """
+    def __init__(self, channels: int, gamma: int = 2, b: int = 1):
+        super().__init__()
+        t   = int(abs(math.log2(channels) / gamma + b / gamma))
+        k   = t if t % 2 else t + 1          # must be odd
+        self.avg = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=k // 2, bias=False)
+        self.sig  = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.avg(x)                        # (B, C, 1, 1)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2))   # (B, 1, C)
+        y = y.transpose(-1, -2).unsqueeze(-1)             # (B, C, 1, 1)
+        return x * self.sig(y)
+
+
+# ── SpectralConv2d ───────────────────────────────────────────────────────────
 class SpectralConv2d(nn.Module):
     """
-    Core FNO layer: FFT → complex weight multiply → iFFT.
-    Keeps only the top modes1 × modes2 frequency components.
-
-    Two weight tensors cover the lower and upper frequency bands
-    in the height dimension (positive and negative frequencies
-    from rfft2), one weight tensor covers the width band.
+    2D Fourier layer: rfft2 → complex weight multiply → irfft2.
+    Two weight tensors cover positive and negative height frequencies.
     """
-    def __init__(self, in_channels: int, out_channels: int,
-                 modes1: int, modes2: int):
+    def __init__(self, in_ch: int, out_ch: int, modes1: int, modes2: int):
         super().__init__()
-        self.in_channels  = in_channels
-        self.out_channels = out_channels
-        self.modes1 = modes1   # height frequency modes
-        self.modes2 = modes2   # width  frequency modes (rfft half-spectrum)
-
-        scale = 1.0 / (in_channels * out_channels)
-        self.weights1 = nn.Parameter(
-            scale * torch.rand(in_channels, out_channels,
-                               modes1, modes2, dtype=torch.cfloat)
-        )
-        self.weights2 = nn.Parameter(
-            scale * torch.rand(in_channels, out_channels,
-                               modes1, modes2, dtype=torch.cfloat)
-        )
+        self.in_ch   = in_ch
+        self.out_ch  = out_ch
+        self.modes1  = modes1
+        self.modes2  = modes2
+        scale = 1.0 / (in_ch * out_ch)
+        self.w1 = nn.Parameter(
+            scale * torch.rand(in_ch, out_ch, modes1, modes2, dtype=torch.cfloat))
+        self.w2 = nn.Parameter(
+            scale * torch.rand(in_ch, out_ch, modes1, modes2, dtype=torch.cfloat))
 
     @staticmethod
-    def _compl_mul2d(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        # x: (B, in_ch, h, w) complex  |  w: (in_ch, out_ch, h, w) complex
+    def _mul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         return torch.einsum("bixy,ioxy->boxy", x, w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-
-        # rfft2 gives (B, C, H, W//2+1) complex coefficients
-        x_ft = torch.fft.rfft2(x, norm="ortho")
-
-        out_ft = torch.zeros(B, self.out_channels, H, W // 2 + 1,
-                             dtype=torch.cfloat, device=x.device)
-
-        # Lower frequency block (top-left of rfft output)
-        out_ft[:, :, :self.modes1, :self.modes2] = self._compl_mul2d(
-            x_ft[:, :, :self.modes1, :self.modes2], self.weights1
-        )
-        # Upper frequency block (negative height frequencies, bottom-left)
-        out_ft[:, :, -self.modes1:, :self.modes2] = self._compl_mul2d(
-            x_ft[:, :, -self.modes1:, :self.modes2], self.weights2
-        )
-
-        return torch.fft.irfft2(out_ft, s=(H, W), norm="ortho")
+        x_ft  = torch.fft.rfft2(x, norm="ortho")
+        out   = torch.zeros(B, self.out_ch, H, W // 2 + 1,
+                            dtype=torch.cfloat, device=x.device)
+        out[:, :, :self.modes1, :self.modes2]  = self._mul(
+            x_ft[:, :, :self.modes1, :self.modes2], self.w1)
+        out[:, :, -self.modes1:, :self.modes2] = self._mul(
+            x_ft[:, :, -self.modes1:, :self.modes2], self.w2)
+        return torch.fft.irfft2(out, s=(H, W), norm="ortho")
 
 
+# ── FNO Block v2 ─────────────────────────────────────────────────────────────
 class FNOBlock(nn.Module):
     """
-    Single FNO block:
-        out = GELU( BN( SpectralConv(x) + W(x) ) )
+    Improved FNO block:
+      out = ECA( BN( GELU( SpectralConv(x) + DWConv3x3(x) ) ) ) + x
 
-    W is a 1×1 pointwise conv bypass — keeps the local linear path
-    alive so gradients do not have to flow only through the FFT.
+    Changes vs v1:
+      - bypass is 3x3 depthwise conv (was 1x1 pointwise)
+        → captures local rod-shape texture of bacilli
+      - ECA channel attention gate after activation
+        → suppresses background, amplifies bacillus channels
+      - residual add AFTER ECA (not before)
+        → gradient flows cleanly through identity shortcut
     """
-    def __init__(self, channels: int, modes1: int, modes2: int):
+    def __init__(self, channels: int, modes1: int, modes2: int,
+                 drop_path: float = 0.0):
         super().__init__()
         self.spectral = SpectralConv2d(channels, channels, modes1, modes2)
-        self.bypass   = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        # 3x3 DWConv captures local texture (acid-fast rod shape)
+        self.bypass   = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, 1, 1, groups=channels, bias=False),
+            nn.Conv2d(channels, channels, 1, bias=False),  # pointwise after DW
+        )
         self.norm     = nn.BatchNorm2d(channels, eps=1e-3, momentum=0.03)
         self.act      = nn.GELU()
+        self.eca      = ECA(channels)
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.norm(self.spectral(x) + self.bypass(x)))
+        y = self.act(self.norm(self.spectral(x) + self.bypass(x)))
+        y = self.eca(y)
+        return x + self.drop_path(y)
 
 
+# ── DropPath ─────────────────────────────────────────────────────────────────
+class DropPath(nn.Module):
+    def __init__(self, p: float = 0.0):
+        super().__init__()
+        self.p = p
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.p == 0.0:
+            return x
+        keep = 1 - self.p
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        r = torch.rand(shape, device=x.device).floor_() + keep
+        return x * r / keep
+
+
+# ── Lightweight SPPF ─────────────────────────────────────────────────────────
+class SPPF(nn.Module):
+    """
+    Spatial Pyramid Pooling Fast — identical to Ultralytics SPPF.
+    Placed at P5 to capture multi-scale global context.
+    """
+    def __init__(self, in_ch: int, out_ch: int, k: int = 5):
+        super().__init__()
+        h = in_ch // 2
+        self.cv1 = nn.Sequential(
+            nn.Conv2d(in_ch, h, 1, bias=False),
+            nn.BatchNorm2d(h, eps=1e-3, momentum=0.03),
+            nn.SiLU(),
+        )
+        self.cv2 = nn.Sequential(
+            nn.Conv2d(h * 4, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch, eps=1e-3, momentum=0.03),
+            nn.SiLU(),
+        )
+        self.pool = nn.MaxPool2d(k, 1, k // 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y  = self.cv1(x)
+        y1 = self.pool(y)
+        y2 = self.pool(y1)
+        y3 = self.pool(y2)
+        return self.cv2(torch.cat([y, y1, y2, y3], 1))
+
+
+# ── FNO Backbone v2 ──────────────────────────────────────────────────────────
 class FNOBackbone(nn.Module):
     """
-    4-block Fourier Neural Operator backbone for YOLOv8.
+    4-block FNO backbone with ECA attention, DWConv bypass, and SPPF at P5.
 
-    Spatial layout (640×640 input)
-    ──────────────────────────────
-    Stem  4×4 conv stride 4  →  96ch  160×160  (P2)
-    FNO Block-1  modes=(20,20)       ← captures ~H/8 periodicity
-    Down  2×2 conv stride 2  → 192ch   80×80   (P3)
-    FNO Block-2  modes=(16,16)       ← captures ~H/5 periodicity
-    Down                     → 384ch   40×40   (P4)
-    FNO Block-3  modes=(12,12)       ← captures ~H/3 periodicity
-    Down                     → 768ch   20×20   (P5)
-    FNO Block-4  modes=( 8, 8)       ← captures ~H/2 periodicity
+    Output: [P2, P3, P4, P5]
+    Channels: [96, 192, 384, 768]  (identical to ConvNeXtV2-tiny — neck unchanged)
 
-    Mode selection rationale
-    ────────────────────────
-    For rfft2 on an H×W tensor the output is H×(W//2+1).
-    We need modes1 ≤ H//2 (so upper and lower bands do not overlap)
-    and modes2 ≤ W//2+1 (half-spectrum width).
+    Modes selected to stay within rfft2 half-spectrum bounds:
+      P2 160x160: modes=20  (max=80)
+      P3  80x80 : modes=16  (max=40)
+      P4  40x40 : modes=12  (max=20)
+      P5  20x20 : modes= 8  (max=10)
 
-      P2 160×160 : rfft → 160×81  → modes=20  (H//2=80 ✓  W/2+1=81 ✓)
-      P3  80×80  : rfft →  80×41  → modes=16  (H//2=40 ✓  W/2+1=41 ✓)
-      P4  40×40  : rfft →  40×21  → modes=12  (H//2=20 ✓  W/2+1=21 ✓)
-      P5  20×20  : rfft →  20×11  → modes= 8  (H//2=10 ✓  W/2+1=11 ✓)
-
-    Channel widths [96,192,384,768] match ConvNeXtV2-tiny exactly,
-    so the PAN-FPN neck YAML needs no changes.
-
-    Returns
-    ───────
-    list of four tensors [P2, P3, P4, P5]
+    Stem redesign: two 3x3 convs (stride 2 each) instead of one 4x4 (stride 4)
+      - fewer aliasing artefacts on tiny bacilli edges
+      - same total stride-4 output
     """
 
-    # Optimum defaults — do not change unless you change the YAML neck too
-    _DEFAULT_DIMS  = [96, 192, 384, 768]
-    _DEFAULT_MODES = [20,  16,  12,   8]
+    _DIMS  = [96, 192, 384, 768]
+    _MODES = [20, 16, 12, 8]
 
     def __init__(self,
                  in_chans: int = 3,
                  dims: list | None = None,
-                 modes: list | None = None):
+                 modes: list | None = None,
+                 drop_path_rate: float = 0.1):
         super().__init__()
-        dims  = dims  or self._DEFAULT_DIMS
-        modes = modes or self._DEFAULT_MODES
-        assert len(dims) == 4 and len(modes) == 4
+        dims  = dims  or self._DIMS
+        modes = modes or self._MODES
+        self.dims = dims
 
-        self.dims = dims   # expose for parse_model channel tracking
+        dp = [x.item() for x in torch.linspace(0, drop_path_rate, 4)]
 
-        # ── Stem ──────────────────────────────────────────────────────────
+        # ── Stem: 3×3-s2 → 3×3-s2 (replaces single 4×4-s4) ─────────────
         self.stem = nn.Sequential(
-            nn.Conv2d(in_chans, dims[0], kernel_size=4, stride=4, bias=False),
+            nn.Conv2d(in_chans, dims[0] // 2, 3, 2, 1, bias=False),
+            nn.BatchNorm2d(dims[0] // 2, eps=1e-3, momentum=0.03),
+            nn.GELU(),
+            nn.Conv2d(dims[0] // 2, dims[0], 3, 2, 1, bias=False),
             nn.BatchNorm2d(dims[0], eps=1e-3, momentum=0.03),
             nn.GELU(),
         )
 
-        # ── Inter-stage downsamples + FNO blocks ──────────────────────────
+        # ── Downsamples + FNO blocks ──────────────────────────────────────
         self.downsamples = nn.ModuleList()
         self.fno_blocks  = nn.ModuleList()
 
         for i in range(4):
             if i == 0:
-                # Stage 0: stem already downsampled; no extra downsample
                 self.downsamples.append(nn.Identity())
             else:
                 self.downsamples.append(nn.Sequential(
-                    nn.Conv2d(dims[i - 1], dims[i],
-                              kernel_size=2, stride=2, bias=False),
+                    nn.Conv2d(dims[i-1], dims[i], 2, 2, bias=False),
                     nn.BatchNorm2d(dims[i], eps=1e-3, momentum=0.03),
                 ))
-            self.fno_blocks.append(FNOBlock(dims[i], modes[i], modes[i]))
+            self.fno_blocks.append(
+                FNOBlock(dims[i], modes[i], modes[i], drop_path=dp[i])
+            )
+
+        # ── SPPF at P5 ────────────────────────────────────────────────────
+        self.sppf = SPPF(dims[3], dims[3])
 
         self._init_weights()
 
@@ -159,14 +223,14 @@ class FNOBackbone(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
-        # SpectralConv2d weights are already initialised in their own __init__
 
     def forward(self, x: torch.Tensor) -> list:
-        """Returns [P2, P3, P4, P5]."""
         x = self.stem(x)
         outs = []
         for i in range(4):
             x = self.downsamples[i](x)
             x = self.fno_blocks[i](x)
+            if i == 3:
+                x = self.sppf(x)
             outs.append(x)
-        return outs   # [P2_96ch, P3_192ch, P4_384ch, P5_768ch]
+        return outs    # [P2_96, P3_192, P4_384, P5_768]
