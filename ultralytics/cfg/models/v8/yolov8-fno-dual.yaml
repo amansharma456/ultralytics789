@@ -1,9 +1,11 @@
-# YOLOv8 + FNO Backbone — TB Bacilli Detection
-# Backbone : 4-block FNO  [96, 192, 384, 768]  modes [20, 16, 12, 8]
-# Neck     : YOLOv8 PAN-FPN (unchanged from stock)
-# Head     : YOLOv8 Detect
+# YOLOv8 + FNO Backbone v2 — Dual Head — TB Bacilli
+# Backbone: FNOBackbone v2 [96, 192, 384, 768]
+# Neck: PAN-FPN with C2f + ECA attention gates at P3 and P4
+# Head 1: P3/P4/P5  strides [8,16,32]  primary
+# Head 2: P2/P3/P4  strides [4,8,16]   auxiliary (small object specialist)
 
 nc: 1
+
 scales:
   n: [0.33, 0.25, 1024]
   s: [0.33, 0.50, 1024]
@@ -12,39 +14,38 @@ scales:
   x: [1.00, 1.25,  512]
 
 backbone:
-  # [from, repeats, module,       args]
-  # Layer 0: run all 4 FNO blocks, caches [P2, P3, P4, P5] in y[0]
-  # Empty args — in_chans injected by parse_model; dims/modes use class defaults
-  - [-1, 1, FNOBackbone,  []]
-
-  # Layers 1-3: extract individual stages with Index(stage_idx)
-  # Index(f=0, stage_idx) pulls element stage_idx from the list y[0]
-  - [0,  1, Index,        [1]]   # layer 1 → P3  192ch  stride 8
-  - [0,  1, Index,        [2]]   # layer 2 → P4  384ch  stride 16
-  - [0,  1, Index,        [3]]   # layer 3 → P5  768ch  stride 32
+  # [from, repeats, module, args]
+  - [-1, 1, FNOBackbone,  []]   # 0  → [P2_96, P3_192, P4_384, P5_768]
+  - [0,  1, Index,        [1]]  # 1    P3  192ch  stride  8
+  - [0,  1, Index,        [2]]  # 2    P4  384ch  stride 16
+  - [0,  1, Index,        [3]]  # 3    P5  768ch  stride 32
 
 head:
-  # ── top-down path (P5 → P4 → P3) ────────────────────────────────────
-  - [-1,  1, nn.Upsample,   [null, 2, "nearest"]]  # 4  upsample P5 → P4 scale
-  - [[2, -1], 1, Concat,    [1]]                   # 5  cat P4(192→384) + up(768) = 1152ch
-  - [-1,  3, C2f,           [384]]                 # 6  neck-P4
+  # ── top-down path ─────────────────────────────────────────────────────
+  - [-1,  1, nn.Upsample,   [null, 2, "nearest"]]  # 4   up P5→P4 scale
+  - [[2, -1], 1, Concat,    [1]]                   # 5   cat P4+up(P5) 1152ch
+  - [-1,  3, C2f,           [384]]                 # 6   neck_P4 384ch
+  - [-1,  1, ECA,           [384]]                 # 7   ECA gate on neck_P4
 
-  - [-1,  1, nn.Upsample,   [null, 2, "nearest"]]  # 7  upsample → P3 scale
-  - [[1, -1], 1, Concat,    [1]]                   # 8  cat P3(192) + up(384) = 576ch
-  - [-1,  3, C2f,           [192]]                 # 9  P3_out  ← small objects
+  - [-1,  1, nn.Upsample,   [null, 2, "nearest"]]  # 8   up neck_P4→P3 scale
+  - [[1, -1], 1, Concat,    [1]]                   # 9   cat P3+up(neck_P4) 576ch
+  - [-1,  3, C2f,           [192]]                 # 10  neck_P3 192ch
+  - [-1,  1, ECA,           [192]]                 # 11  ECA gate on neck_P3
 
-  # ── bottom-up path (P3 → P4 → P5) ───────────────────────────────────
-  - [-1,  1, Conv,          [192, 3, 2]]           # 10 stride-2 downsample
-  - [[6, -1], 1, Concat,    [1]]                   # 11 cat neck-P4(384) + down(192)
-  - [-1,  3, C2f,           [384]]                 # 12 P4_out  ← medium objects
+  # ── bottom-up path ────────────────────────────────────────────────────
+  - [-1,  1, Conv,          [192, 3, 2]]           # 12  stride-2 down
+  - [[7, -1], 1, Concat,    [1]]                   # 13  cat neck_P4(384)+down(192) 576ch
+  - [-1,  3, C2f,           [384]]                 # 14  P4_out 384ch
 
-  - [-1,  1, Conv,          [384, 3, 2]]           # 13 stride-2 downsample
-  - [[3, -1], 1, Concat,    [1]]                   # 14 cat P5(768) + down(384)
-  - [-1,  3, C2f,           [768]]                 # 15 P5_out  ← large objects
+  - [-1,  1, Conv,          [384, 3, 2]]           # 15  stride-2 down
+  - [[3, -1], 1, Concat,    [1]]                   # 16  cat P5(768)+down(384) 1152ch
+  - [-1,  3, C2f,           [768]]                 # 17  P5_out 768ch
 
-  # ── detection head ───────────────────────────────────────────────────
-  - [[9, 12, 15], 1, Detect, [nc]]                 # 16 Detect on P3/P4/P5
-    # ── second head: operates at finer scales [4, 8, 16] ─────────────────
-  - [0,  1, Index,        [0]]      # 17  P2   96ch  stride 4  (from backbone cache)
-  - [-1, 1, Conv,         [96, 3, 1]]             # 18  P2 refined  96ch
-  - [[18, 9, 12], 1, Detect, [nc]]               # 19  Head-2  strides [4, 8, 16]
+  # ── Head 1: primary  P3/P4/P5 strides [8,16,32] ──────────────────────
+  - [[11, 14, 17], 1, Detect, [nc]]                # 18  Head-1
+
+  # ── Head 2: auxiliary P2/P3/P4 strides [4,8,16] ─────────────────────
+  - [0,  1, Index,          [0]]                   # 19  P2  96ch  stride 4
+  - [-1, 1, Conv,           [96, 3, 1]]            # 20  P2 refined 96ch
+  - [-1, 1, ECA,            [96]]                  # 21  ECA gate on P2
+  - [[21, 11, 14], 1, Detect, [nc]]                # 22  Head-2
