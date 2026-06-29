@@ -5,6 +5,7 @@ import pickle
 import re
 import threading
 from copy import deepcopy
+from ultralytics.nn.modules.fno_backbone import FNOBackbone, ECA
 from pathlib import Path
 from ultralytics.nn.modules import (              
         ConvNeXtV2Backbone, FNOBackbone  
