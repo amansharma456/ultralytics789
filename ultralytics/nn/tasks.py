@@ -676,7 +676,7 @@ class DualDetectionLoss:
     else (nc, no, reg_max, BboxLoss, TaskAlignedAssigner) is shared via shallow copy.
     """
 
-    def __init__(self, model, primary_weight=1.0, auxiliary_weight=0.4):
+    def __init__(self, model, primary_weight=1.0, auxiliary_weight=1.0):
         from ultralytics.utils.loss import v8DetectionLoss
         import copy
 
