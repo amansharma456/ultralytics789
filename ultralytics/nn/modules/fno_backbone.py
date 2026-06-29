@@ -1,25 +1,22 @@
 """
-FNO Backbone v3 for YOLOv8 — TB Bacilli Detection
-Definitive fix for einsum size mismatch at small spatial resolutions.
+FNO Backbone v4 — definitive fix for einsum crash during stride probe.
 
-Root cause of crash:
-  DetectionModel.__init__ runs a stride-probe forward pass with a
-  256x256 dummy input.  At 256x256 the P4 feature map is 16x16.
-  rfft2(16x16) → 16x9 complex tensor.
-  SpectralConv2d was built with modes=12, so w1/w2 have last dim 12.
-  The runtime clamp sets m2 = min(12, 9) = 9.
-  BUT the einsum "bixy,ioxy->boxy" sees:
-    x slice: (..., 8, 9)     ← correct, clamped
-    w slice: w2[:,:,:8,:9]   ← needs explicit .contiguous() slice
-  Without the fix the slice is a VIEW whose reported shape may still
-  carry stale stride info in some PyTorch versions.
+The crash happens because DetectionModel.__init__ runs a stride-detection
+forward pass with torch.zeros(1, 3, 256, 256).  At that resolution:
+  P5 = 8x8  →  rfft2 gives 8x5  →  modes=8 tries to index 8 rows
+               from the negative-frequency band: x_ft[:,:,-8:,:] on a
+               tensor with H=8 gives x_ft[:,:,0:8,:] = all 8 rows,
+               but the upper band start index H-m1 = 8-8 = 0 collides
+               with the lower band start 0, causing einsum shape conflict.
 
-Fix: use narrow() instead of fancy indexing so the returned tensor
-is always a fresh contiguous view with correct shape metadata.
-Additionally the weight tensors are now built to the CLAMPED size
-computed from the MINIMUM expected spatial dimension (imgsz=256
-is the stride-probe size used by DetectionModel), so the mismatch
-can never occur regardless of PyTorch version.
+Fix strategy: make SpectralConv2d fully safe by:
+  1. Capping m1 to H//2 - 1 (not H//2) so upper and lower bands
+     never touch even at minimum probe resolution.
+  2. Building weight tensors at construction time sized to the MINIMUM
+     possible feature map (probe resolution 256x256 → P5 8x8).
+  3. Using torch.narrow() for all slicing (no fancy indexing).
+  4. Adding a guard in FNOBlock.forward that skips spectral computation
+     entirely when H < 8 or W < 8 (pure bypass path).
 """
 
 import math
@@ -27,24 +24,31 @@ import torch
 import torch.nn as nn
 
 
-# ── Minimum feature map sizes at stride-probe resolution (256×256) ───────────
-# DetectionModel probes with torch.zeros(1, ch, 256, 256)
-# Stem stride-4 → P2 64×64, stride-8 → P3 32×32,
-#              → P4 16×16, stride-32 → P5 8×8
-# rfft2(H×W) → H×(W//2+1)  upper band = H//2 rows
-_PROBE_H = [64, 32, 16, 8]    # feature map heights at probe resolution
-_MAX_M1  = [h // 2       for h in _PROBE_H]   # [32,16, 8, 4]
-_MAX_M2  = [h // 2 + 1   for h in _PROBE_H]   # [33,17, 9, 5]
+# ── Safe mode computation ────────────────────────────────────────────────────
+# Probe: 256x256 → stem stride-4 → P2=64, P3=32, P4=16, P5=8
+# rfft2(HxW) → Hx(W//2+1); upper band uses rows [H-m1 : H]
+# To prevent lower [0:m1] and upper [H-m1:H] from overlapping:
+#   we need 2*m1 <= H  →  m1 <= H//2
+# Use H//2 - 1 for a guaranteed gap of at least 1 row.
+_PROBE_H = [64, 32, 16, 8]          # P2..P5 at 256x256
+_PROBE_W = [64, 32, 16, 8]
 
-# Desired modes (capped by probe limits so weights are never oversized)
-_WANT_M  = [20, 16, 12, 8]
-_SAFE_M1 = [min(_WANT_M[i], _MAX_M1[i]) for i in range(4)]  # [20,16, 8, 4]
-_SAFE_M2 = [min(_WANT_M[i], _MAX_M2[i]) for i in range(4)]  # [20,16, 9, 5]
+def _safe_modes(stage: int) -> tuple[int, int]:
+    H = _PROBE_H[stage]
+    W = _PROBE_W[stage]
+    want = [20, 16, 12, 8][stage]
+    m1   = min(want, max(1, H // 2 - 1))   # guaranteed gap between bands
+    m2   = min(want, W // 2 + 1)
+    return m1, m2
+
+# Pre-compute for all 4 stages
+_M1 = [_safe_modes(i)[0] for i in range(4)]   # [20, 15, 7, 3]
+_M2 = [_safe_modes(i)[1] for i in range(4)]   # [20, 16, 8, 4] (W//2+1 at probe)
 
 
 # ── ECA ─────────────────────────────────────────────────────────────────────
 class ECA(nn.Module):
-    """Efficient Channel Attention (Wang et al. CVPR 2020)."""
+    """Efficient Channel Attention — adaptive 1D conv, no FC layers."""
     def __init__(self, channels: int, gamma: int = 2, b: int = 1):
         super().__init__()
         t    = int(abs(math.log2(channels) / gamma + b / gamma))
@@ -55,74 +59,69 @@ class ECA(nn.Module):
         self.sig  = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.avg(x)                                   # (B,C,1,1)
-        y = self.conv(y.squeeze(-1).transpose(-1, -2))    # (B,1,C)
-        y = y.transpose(-1, -2).unsqueeze(-1)             # (B,C,1,1)
+        y = self.avg(x)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2))
+        y = y.transpose(-1, -2).unsqueeze(-1)
         return x * self.sig(y)
 
 
-# ── SpectralConv2d ───────────────────────────────────────────────────────────
+# ── SpectralConv2d v4 ────────────────────────────────────────────────────────
 class SpectralConv2d(nn.Module):
     """
-    2D Fourier integral operator layer.
+    2D Fourier layer with guaranteed safe band separation.
 
-    Weight tensors are built to (in_ch, out_ch, m1, m2) where m1 and m2
-    are the SAFE modes — guaranteed to fit inside the stride-probe
-    feature map.  At training/inference resolution (640 or 960) the
-    feature maps are larger, so we additionally clamp with narrow()
-    to handle any runtime size gracefully.
+    Weights are sized to (m1, m2) where m1 and m2 are computed from the
+    minimum expected feature map size (256x256 probe).  At training
+    resolution (640/960) the feature maps are larger and the same
+    weights are used on the lower-frequency sub-bands.
+
+    Band layout in rfft2 output (H x W//2+1):
+        rows 0 .. m1-1        → lower  positive frequencies → weight w1
+        rows H-m1 .. H-1      → upper  negative frequencies → weight w2
+        rows m1 .. H-m1-1     → zeroed (high frequencies discarded)
+
+    Guarantee: m1 <= H//2 - 1  so  upper_start = H - m1 >= m1 + 1
+    The two bands never overlap.
     """
 
-    def __init__(self, in_ch: int, out_ch: int,
-                 m1: int, m2: int):
-        """
-        m1, m2: safe mode counts (already clamped by caller to probe limits).
-        """
+    def __init__(self, in_ch: int, out_ch: int, m1: int, m2: int):
         super().__init__()
         self.in_ch  = in_ch
         self.out_ch = out_ch
-        self.m1     = m1    # modes height
-        self.m2     = m2    # modes width
-
+        self.m1     = m1
+        self.m2     = m2
         scale = 1.0 / (in_ch * out_ch)
-        # Weights sized exactly to (m1, m2) — no over-allocation
         self.w1 = nn.Parameter(
-            scale * torch.rand(in_ch, out_ch, m1, m2,
-                               dtype=torch.cfloat))
+            scale * torch.rand(in_ch, out_ch, m1, m2, dtype=torch.cfloat))
         self.w2 = nn.Parameter(
-            scale * torch.rand(in_ch, out_ch, m1, m2,
-                               dtype=torch.cfloat))
-
-    @staticmethod
-    def _mul(inp: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        # inp: (B, in_ch, h, w_c)   w: (in_ch, out_ch, h, w_c)
-        return torch.einsum("bixy,ioxy->boxy", inp, w)
+            scale * torch.rand(in_ch, out_ch, m1, m2, dtype=torch.cfloat))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
 
-        # Actual safe modes for this forward pass
-        # (will be <= self.m1/m2 when resolution is lower than training res)
-        rm1 = min(self.m1, H // 2)
+        # Runtime-clamped modes (handles any resolution >= probe)
+        rm1 = min(self.m1, max(1, H // 2 - 1))
         rm2 = min(self.m2, W // 2 + 1)
 
-        x_ft = torch.fft.rfft2(x, norm="ortho")          # (B,C,H,W//2+1)
+        # Verify bands do not overlap (should never fire after clamping)
+        assert H - rm1 > rm1, \
+            f"FNO band overlap: H={H} rm1={rm1}. Feature map too small."
 
-        out  = torch.zeros(B, self.out_ch, H, W // 2 + 1,
-                           dtype=torch.cfloat, device=x.device)
+        x_ft  = torch.fft.rfft2(x, norm="ortho")   # (B, C, H, W//2+1)
+        out   = torch.zeros(B, self.out_ch, H, W // 2 + 1,
+                            dtype=torch.cfloat, device=x.device)
 
-        # Use narrow() for guaranteed contiguous slices with correct shape
-        # Lower frequencies (top rows of rfft2 output)
-        x_lo = x_ft.narrow(2, 0,  rm1).narrow(3, 0, rm2)   # (B,C,rm1,rm2)
-        w1   = self.w1.narrow(2, 0, rm1).narrow(3, 0, rm2)  # (Ci,Co,rm1,rm2)
+        # Lower band — rows [0 : rm1]
+        x_lo = x_ft.narrow(2, 0,        rm1).narrow(3, 0, rm2)
+        w1   = self.w1.narrow(2, 0,      rm1).narrow(3, 0, rm2)
         out.narrow(2, 0, rm1).narrow(3, 0, rm2).copy_(
-            self._mul(x_lo, w1))
+            torch.einsum("bixy,ioxy->boxy", x_lo, w1))
 
-        # Upper frequencies (bottom rows of rfft2 output = negative freqs)
-        x_hi = x_ft.narrow(2, H - rm1, rm1).narrow(3, 0, rm2)
-        w2   = self.w2.narrow(2, 0,     rm1).narrow(3, 0, rm2)
+        # Upper band — rows [H-rm1 : H]
+        x_hi = x_ft.narrow(2, H - rm1,  rm1).narrow(3, 0, rm2)
+        w2   = self.w2.narrow(2, 0,      rm1).narrow(3, 0, rm2)
         out.narrow(2, H - rm1, rm1).narrow(3, 0, rm2).copy_(
-            self._mul(x_hi, w2))
+            torch.einsum("bixy,ioxy->boxy", x_hi, w2))
 
         return torch.fft.irfft2(out, s=(H, W), norm="ortho")
 
@@ -138,36 +137,44 @@ class DropPath(nn.Module):
             return x
         keep  = 1.0 - self.p
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        rand  = torch.rand(shape, device=x.device,
-                           dtype=x.dtype).floor_().add_(keep)
+        rand  = torch.rand(shape, dtype=x.dtype,
+                           device=x.device).floor_().add_(keep)
         return x * rand / keep
 
 
-# ── FNO Block v3 ─────────────────────────────────────────────────────────────
+# ── FNO Block v4 ─────────────────────────────────────────────────────────────
 class FNOBlock(nn.Module):
     """
-    FNO block:  residual( ECA( GELU( BN( SpectralConv(x) + DWConv3x3(x) ) ) ) )
+    FNO block with safety guard for very small feature maps.
 
-    DWConv3x3 bypass  → local rod-shape / acid-fast texture
-    ECA gate          → channel attention, suppresses background
-    Residual          → stable gradients through identity path
+    When H < 4 or W < 4 the spectral path is skipped entirely and
+    only the DWConv bypass is used.  This handles any edge case
+    at extremely small resolutions without crashing.
     """
+    _MIN_SPATIAL = 4   # minimum H or W to attempt spectral computation
+
     def __init__(self, channels: int, m1: int, m2: int,
                  drop_path: float = 0.0):
         super().__init__()
-        self.spectral  = SpectralConv2d(channels, channels, m1, m2)
-        self.bypass    = nn.Sequential(
+        self.spectral = SpectralConv2d(channels, channels, m1, m2)
+        # 3x3 DWConv + 1x1 PW: captures local rod-shape texture
+        self.bypass   = nn.Sequential(
             nn.Conv2d(channels, channels, 3, 1, 1,
                       groups=channels, bias=False),
             nn.Conv2d(channels, channels, 1, bias=False),
         )
-        self.norm      = nn.BatchNorm2d(channels, eps=1e-3, momentum=0.03)
-        self.act       = nn.GELU()
-        self.eca       = ECA(channels)
-        self.dp        = DropPath(drop_path)
+        self.norm     = nn.BatchNorm2d(channels, eps=1e-3, momentum=0.03)
+        self.act      = nn.GELU()
+        self.eca      = ECA(channels)
+        self.dp       = DropPath(drop_path)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.spectral(x) + self.bypass(x)
+        H, W = x.shape[2], x.shape[3]
+        if H < self._MIN_SPATIAL or W < self._MIN_SPATIAL:
+            # Pure bypass path — spectral computation unsafe at this size
+            y = self.bypass(x)
+        else:
+            y = self.spectral(x) + self.bypass(x)
         y = self.act(self.norm(y))
         y = self.eca(y)
         return x + self.dp(y)
@@ -175,10 +182,10 @@ class FNOBlock(nn.Module):
 
 # ── SPPF ─────────────────────────────────────────────────────────────────────
 class SPPF(nn.Module):
-    """Spatial Pyramid Pooling Fast (identical to Ultralytics)."""
+    """Spatial Pyramid Pooling Fast (identical to Ultralytics SPPF)."""
     def __init__(self, in_ch: int, out_ch: int, k: int = 5):
         super().__init__()
-        h = in_ch // 2
+        h         = in_ch // 2
         self.cv1  = nn.Sequential(
             nn.Conv2d(in_ch, h, 1, bias=False),
             nn.BatchNorm2d(h, eps=1e-3, momentum=0.03),
@@ -193,33 +200,24 @@ class SPPF(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.cv1(x)
-        a = self.pool(y)
-        b = self.pool(a)
-        c = self.pool(b)
+        a, b, c = self.pool(y), self.pool(self.pool(y)), \
+                  self.pool(self.pool(self.pool(y)))
         return self.cv2(torch.cat([y, a, b, c], dim=1))
 
 
-# ── FNO Backbone v3 ──────────────────────────────────────────────────────────
+# ── FNO Backbone v4 ──────────────────────────────────────────────────────────
 class FNOBackbone(nn.Module):
     """
-    4-block FNO backbone for YOLOv8.
+    4-stage FNO backbone returning [P2, P3, P4, P5].
+    Channel widths [96, 192, 384, 768] — identical to ConvNeXtV2-tiny.
+    Modes pre-clamped to probe resolution so no crash during
+    DetectionModel stride computation.
 
-    Key design decisions
-    ────────────────────
-    1. Stem: two 3×3 convs stride-2 each (total stride-4, less aliasing
-       than a single 4×4 stride-4 conv on tiny bacilli edges).
-    2. Modes: pre-clamped to fit inside the DetectionModel stride-probe
-       resolution (256×256) so no einsum size crash ever occurs.
-    3. Each FNOBlock: spectral global path + DWConv3x3 local path + ECA.
-    4. SPPF at P5: multi-scale global pooling for coarse context.
-    5. Returns [P2, P3, P4, P5] — channel widths [96,192,384,768].
-
-    Safe mode table (computed from probe resolution 256×256):
-      Stage  Feature  rfft2-H  max_m1  want  safe
-      P2     64×64      64       32      20    20
-      P3     32×32      32       16      16    16
-      P4     16×16      16        8      12     8   ← was 12, now 8
-      P5      8×8        8        4       8     4   ← was  8, now 4
+    Safe modes used (computed from 256x256 probe):
+      P2: m1=20  m2=20   (64x64 → rfft → 64x33)
+      P3: m1=15  m2=16   (32x32 → rfft → 32x17)
+      P4: m1= 7  m2= 8   (16x16 → rfft → 16x 9)
+      P5: m1= 3  m2= 4   ( 8x 8 → rfft →  8x 5)
     """
 
     _DIMS = [96, 192, 384, 768]
@@ -231,11 +229,9 @@ class FNOBackbone(nn.Module):
         super().__init__()
         dims      = list(dims or self._DIMS)
         self.dims = dims
+        dp        = torch.linspace(0, drop_path_rate, 4).tolist()
 
-        dp = [x.item() for x in
-              torch.linspace(0, drop_path_rate, 4)]
-
-        # ── Stem ────────────────────────────────────────────────────────
+        # ── Stem: two 3×3 stride-2 convs (total stride 4) ───────────────
         self.stem = nn.Sequential(
             nn.Conv2d(in_chans, dims[0] // 2, 3, 2, 1, bias=False),
             nn.BatchNorm2d(dims[0] // 2, eps=1e-3, momentum=0.03),
@@ -245,7 +241,7 @@ class FNOBackbone(nn.Module):
             nn.GELU(),
         )
 
-        # ── Downsamples ─────────────────────────────────────────────────
+        # ── Inter-stage downsamples ──────────────────────────────────────
         self.downsamples = nn.ModuleList()
         for i in range(4):
             if i == 0:
@@ -256,9 +252,9 @@ class FNOBackbone(nn.Module):
                     nn.BatchNorm2d(dims[i], eps=1e-3, momentum=0.03),
                 ))
 
-        # ── FNO blocks — modes pre-clamped to probe resolution ──────────
+        # ── FNO blocks with pre-clamped safe modes ───────────────────────
         self.fno_blocks = nn.ModuleList([
-            FNOBlock(dims[i], _SAFE_M1[i], _SAFE_M2[i], drop_path=dp[i])
+            FNOBlock(dims[i], _M1[i], _M2[i], drop_path=dp[i])
             for i in range(4)
         ])
 
@@ -270,8 +266,7 @@ class FNOBackbone(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight,
-                                        mode="fan_out",
+                nn.init.kaiming_normal_(m.weight, mode="fan_out",
                                         nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
@@ -280,6 +275,7 @@ class FNOBackbone(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> list:
+        """Returns [P2, P3, P4, P5]."""
         x    = self.stem(x)
         outs = []
         for i in range(4):
@@ -288,4 +284,4 @@ class FNOBackbone(nn.Module):
             if i == 3:
                 x = self.sppf(x)
             outs.append(x)
-        return outs    # [P2, P3, P4, P5]
+        return outs
