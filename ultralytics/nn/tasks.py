@@ -1941,6 +1941,8 @@ def parse_model(d, ch, verbose=True):
             GhostBottleneck,
             SPP,
             SPPF,
+            ASPP,        # ← add this
+            ASPP_SOD,    # ← add this
             C2fPSA,
             C2PSA,
             DWConv,
