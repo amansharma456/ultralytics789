@@ -2257,3 +2257,310 @@ def guess_model_task(model):
         "Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify', 'pose', 'obb' or 'semantic'."
     )
     return "detect"  # assume detect
+    # ═══════════════════════════════════════════════════════════════════
+# Swin Transformer Backbone — defined here to avoid import caching
+# ═══════════════════════════════════════════════════════════════════
+
+import math as _math
+
+
+def _window_partition(x, window_size):
+    """x: (B, H, W, C) → windows: (num_windows*B, window_size, window_size, C)"""
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
+
+
+def _window_reverse(windows, window_size, H, W):
+    """windows: (num_windows*B, window_size, window_size, C) → x: (B, H, W, C)"""
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
+
+
+class _WindowAttention(torch.nn.Module):
+    """Window-based multi-head self-attention with relative position bias."""
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True):
+        super().__init__()
+        self.dim         = dim
+        self.window_size = window_size   # (Wh, Ww)
+        self.num_heads   = num_heads
+        head_dim         = dim // num_heads
+        self.scale       = head_dim ** -0.5
+
+        # Relative position bias table
+        self.relative_position_bias_table = torch.nn.Parameter(
+            torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads))
+
+        coords_h = torch.arange(window_size)
+        coords_w = torch.arange(window_size)
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing="ij"))
+        coords_flatten = torch.flatten(coords, 1)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        relative_coords[:, :, 0] += window_size - 1
+        relative_coords[:, :, 1] += window_size - 1
+        relative_coords[:, :, 0] *= 2 * window_size - 1
+        relative_position_index = relative_coords.sum(-1)
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkv  = torch.nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = torch.nn.Linear(dim, dim)
+        torch.nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+        self.softmax = torch.nn.Softmax(dim=-1)
+
+    def forward(self, x, mask=None):
+        """x: (num_windows*B, N, C)  where N = window_size*window_size"""
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
+
+        rpb = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size * self.window_size, self.window_size * self.window_size, -1)
+        rpb = rpb.permute(2, 0, 1).contiguous()
+        attn = attn + rpb.unsqueeze(0)
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+
+        attn = self.softmax(attn)
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        return self.proj(x)
+
+
+class _SwinMLP(torch.nn.Module):
+    def __init__(self, dim, hidden_dim):
+        super().__init__()
+        self.fc1  = torch.nn.Linear(dim, hidden_dim)
+        self.act  = torch.nn.GELU()
+        self.fc2  = torch.nn.Linear(hidden_dim, dim)
+
+    def forward(self, x):
+        return self.fc2(self.act(self.fc1(x)))
+
+
+class _SwinBlock(torch.nn.Module):
+    """
+    Single Swin Transformer block.
+    shift_size=0 → regular window attention (W-MSA)
+    shift_size=window_size//2 → shifted window attention (SW-MSA)
+    Alternating W-MSA / SW-MSA across blocks in a stage gives
+    cross-window connections without full quadratic attention.
+    """
+    def __init__(self, dim, num_heads, window_size=7, shift_size=0,
+                 mlp_ratio=4.0, drop_path=0.0):
+        super().__init__()
+        self.dim         = dim
+        self.window_size = window_size
+        self.shift_size  = shift_size
+
+        self.norm1 = torch.nn.LayerNorm(dim)
+        self.attn  = _WindowAttention(dim, window_size, num_heads)
+        self.norm2 = torch.nn.LayerNorm(dim)
+        self.mlp   = _SwinMLP(dim, int(dim * mlp_ratio))
+        self.dp_prob = drop_path
+
+    def _drop_path(self, x):
+        if not self.training or self.dp_prob == 0:
+            return x
+        keep  = 1.0 - self.dp_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        rand  = torch.rand(shape, device=x.device, dtype=x.dtype).floor_().add_(keep)
+        return x * rand / keep
+
+    def _attn_mask(self, H, W, device):
+        """Compute mask for shifted-window attention (prevents cross-boundary leakage)."""
+        if self.shift_size == 0:
+            return None
+        img_mask = torch.zeros((1, H, W, 1), device=device)
+        h_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
+        w_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
+        cnt = 0
+        for h in h_slices:
+            for w in w_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
+        mask_windows = _window_partition(img_mask, self.window_size).view(-1, self.window_size * self.window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        return attn_mask
+
+    def forward(self, x, H, W):
+        """x: (B, H*W, C)"""
+        B, L, C = x.shape
+        shortcut = x
+        x = self.norm1(x).view(B, H, W, C)
+
+        # Pad to multiple of window_size if needed
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        if pad_r > 0 or pad_b > 0:
+            x = torch.nn.functional.pad(x, (0, 0, 0, pad_r, 0, pad_b))
+        Hp, Wp = H + pad_b, W + pad_r
+
+        if self.shift_size > 0:
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted_x = x
+
+        x_windows = _window_partition(shifted_x, self.window_size)
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+
+        attn_mask = self._attn_mask(Hp, Wp, x.device)
+        attn_windows = self.attn(x_windows, mask=attn_mask)
+
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        shifted_x = _window_reverse(attn_windows, self.window_size, Hp, Wp)
+
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+
+        if pad_r > 0 or pad_b > 0:
+            x = x[:, :H, :W, :].contiguous()
+
+        x = x.view(B, H * W, C)
+        x = shortcut + self._drop_path(x)
+        x = x + self._drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+class _PatchMerging(torch.nn.Module):
+    """Downsample by 2x: concat 2x2 neighboring patches, then linear project to 2*dim."""
+    def __init__(self, dim):
+        super().__init__()
+        self.norm = torch.nn.LayerNorm(4 * dim)
+        self.reduction = torch.nn.Linear(4 * dim, 2 * dim, bias=False)
+
+    def forward(self, x, H, W):
+        B, L, C = x.shape
+        x = x.view(B, H, W, C)
+
+        pad_r = W % 2
+        pad_b = H % 2
+        if pad_r or pad_b:
+            x = torch.nn.functional.pad(x, (0, 0, 0, pad_r, 0, pad_b))
+
+        x0 = x[:, 0::2, 0::2, :]
+        x1 = x[:, 1::2, 0::2, :]
+        x2 = x[:, 0::2, 1::2, :]
+        x3 = x[:, 1::2, 1::2, :]
+        x = torch.cat([x0, x1, x2, x3], -1)
+        x = x.view(B, -1, 4 * C)
+        x = self.norm(x)
+        return self.reduction(x)
+
+
+class _SwinStage(torch.nn.Module):
+    def __init__(self, dim, depth, num_heads, window_size=7,
+                 mlp_ratio=4.0, drop_path_rates=None):
+        super().__init__()
+        drop_path_rates = drop_path_rates or [0.0] * depth
+        self.blocks = torch.nn.ModuleList([
+            _SwinBlock(dim, num_heads, window_size,
+                      shift_size=0 if i % 2 == 0 else window_size // 2,
+                      mlp_ratio=mlp_ratio, drop_path=drop_path_rates[i])
+            for i in range(depth)
+        ])
+
+    def forward(self, x, H, W):
+        for blk in self.blocks:
+            x = blk(x, H, W)
+        return x
+
+
+class SwinBackbone(torch.nn.Module):
+    """
+    Swin Transformer Tiny backbone, adapted for YOLOv8.
+
+    Native hierarchical output — no Index/multi-output plumbing needed
+    beyond what FNOBackbone already required, but here the four scales
+    are produced by genuine architectural downsampling (PatchMerging),
+    not channel-preserving spectral blocks.
+
+    Returns [P2, P3, P4, P5] as (B, C, H, W) tensors (converted from
+    Swin's native (B, N, C) token format at each stage boundary).
+
+    Config (Swin-T):
+      depths     = [2, 2, 6, 2]
+      dims       = [96, 192, 384, 768]
+      num_heads  = [3, 6, 12, 24]
+      window_size= 7
+    """
+    _DIMS      = [96, 192, 384, 768]
+    _DEPTHS    = [2, 2, 6, 2]
+    _NUM_HEADS = [3, 6, 12, 24]
+    _WINDOW    = 7
+
+    def __init__(self, in_chans=3, drop_path_rate=0.1):
+        super().__init__()
+        dims, depths, heads, window = self._DIMS, self._DEPTHS, self._NUM_HEADS, self._WINDOW
+        self.dims = list(dims)
+
+        # Patch embed: 4x4 conv, stride 4 → P2 native resolution
+        self.patch_embed = torch.nn.Conv2d(in_chans, dims[0], kernel_size=4, stride=4)
+        self.patch_norm  = torch.nn.LayerNorm(dims[0])
+
+        total_blocks = sum(depths)
+        dpr = torch.linspace(0, drop_path_rate, total_blocks).tolist()
+        cur = 0
+
+        self.stages    = torch.nn.ModuleList()
+        self.merges    = torch.nn.ModuleList()   # patch merging BEFORE stages 1,2,3
+        self.out_norms = torch.nn.ModuleList([torch.nn.LayerNorm(d) for d in dims])
+
+        for i in range(4):
+            if i > 0:
+                self.merges.append(_PatchMerging(dims[i - 1]))
+            else:
+                self.merges.append(torch.nn.Identity())
+
+            self.stages.append(_SwinStage(
+                dims[i], depths[i], heads[i], window,
+                drop_path_rates=dpr[cur:cur + depths[i]]))
+            cur += depths[i]
+
+        for m in self.modules():
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
+            elif isinstance(m, torch.nn.LayerNorm):
+                torch.nn.init.zeros_(m.bias)
+                torch.nn.init.ones_(m.weight)
+            elif isinstance(m, torch.nn.Conv2d):
+                torch.nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """Returns [P2, P3, P4, P5] as (B, C, H, W) tensors."""
+        B = x.shape[0]
+        x = self.patch_embed(x)                 # (B, C0, H0, W0)
+        _, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)         # (B, H*W, C)
+        x = self.patch_norm(x)
+
+        outs = []
+        for i in range(4):
+            if i > 0:
+                x = self.merges[i](x, H, W)
+                H, W = H // 2, W // 2
+
+            x = self.stages[i](x, H, W)
+
+            # Convert token format → spatial format for output
+            x_out = self.out_norms[i](x)
+            x_out = x_out.transpose(1, 2).reshape(B, self.dims[i], H, W)
+            outs.append(x_out)
+
+        return outs   # [P2_96, P3_192, P4_384, P5_768]    
+        
