@@ -2032,6 +2032,10 @@ def parse_model(d, ch, verbose=True):
         elif m is AIFI:
             args = [ch[f], *args]
 
+        elif m is SwinBackbone:
+            args = [ch[f]]          # in_chans from ch[f]
+            c2   = None             # multi-output; set below after build    
+
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
@@ -2133,7 +2137,9 @@ def parse_model(d, ch, verbose=True):
             multi_out_ch[i] = list(m_.dims)   # e.g. [96, 192, 384, 768] for tiny
             c2 = m_.dims[-1]                  # ch list carries the last-stage width;
                                               # individual stage widths live in multi_out_ch
-
+        if m is SwinBackbone:
+            multi_out_ch[i] = list(m_.dims)
+            c2 = m_.dims[-1]
         if verbose:
             LOGGER.info(f"{i:>3}{f!s:>20}{n_:>3}{m_.np:10.0f}  {t:<45}{args!s:<30}")
 
