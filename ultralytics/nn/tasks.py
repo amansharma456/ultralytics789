@@ -2570,5 +2570,402 @@ class SwinBackbone(torch.nn.Module):
             x_out = x_out.transpose(1, 2).reshape(B, self.dims[i], H, W)
             outs.append(x_out)
 
-        return outs   # [P2_96, P3_192, P4_384, P5_768]    
-        
+        return outs   # [P2_96, P3_192, P4_384, P5_768]   
+# ═══════════════════════════════════════════════════════════════════
+# ASPP — replaces SPPF, tuned for small-object (TB bacilli) detection
+# ═══════════════════════════════════════════════════════════════════
+
+class ASPP(torch.nn.Module):
+    """
+    Atrous Spatial Pyramid Pooling, re-tuned for small objects.
+
+    Standard DeepLab ASPP uses dilation rates 6, 12, 18 — tuned for
+    513x513 segmentation inputs with large objects. At those rates,
+    on a P5 (stride 32) feature map, the effective sampling distance
+    in original-image pixels is 192/384/576px, which is far larger
+    than a 15-30px bacillus. The conv ends up sampling background
+    noise instead of the object itself.
+
+    This version uses rates [1, 3, 5] by default (overridable),
+    keeps the rate=1 branch un-dilated for fine local detail, and
+    gives that branch more weight in the final fusion by simply
+    including it — it is the only branch with zero gridding effect.
+
+    Branches:
+      1. 1x1 conv                      (channel reduction, global mix)
+      2. 3x3 conv, dilation=rates[0]   (default 1 — plain local conv)
+      3. 3x3 conv, dilation=rates[1]   (default 3)
+      4. 3x3 conv, dilation=rates[2]   (default 5)
+      5. image pooling branch (global avg pool + 1x1 + upsample)
+    All branches projected to out_ch//5... no — projected individually
+    to out_ch_branch, concatenated, then fused with a final 1x1 conv.
+    """
+
+    def __init__(self, c1, c2, rates=(1, 3, 5)):
+        super().__init__()
+        assert len(rates) == 3, "ASPP expects exactly 3 dilation rates"
+        hidden = c2 // 4   # 4 conv branches share channel budget evenly
+
+        def _conv_bn_act(cin, cout, k, d):
+            pad = d * (k - 1) // 2
+            return torch.nn.Sequential(
+                torch.nn.Conv2d(cin, cout, k, 1, pad, dilation=d, bias=False),
+                torch.nn.BatchNorm2d(cout, eps=1e-3, momentum=0.03),
+                torch.nn.SiLU(inplace=True),
+            )
+
+        # Branch 1: 1x1, no dilation — channel mixing only
+        self.branch1 = _conv_bn_act(c1, hidden, 1, 1)
+
+        # Branches 2-4: 3x3 with configurable dilation rates
+        self.branch2 = _conv_bn_act(c1, hidden, 3, rates[0])
+        self.branch3 = _conv_bn_act(c1, hidden, 3, rates[1])
+        self.branch4 = _conv_bn_act(c1, hidden, 3, rates[2])
+
+        # Branch 5: global image pooling — coarse global context
+        self.global_pool = torch.nn.Sequential(
+            torch.nn.AdaptiveAvgPool2d(1),
+            torch.nn.Conv2d(c1, hidden, 1, bias=False),
+            torch.nn.BatchNorm2d(hidden, eps=1e-3, momentum=0.03),
+            torch.nn.SiLU(inplace=True),
+        )
+
+        # Fusion: concat all 5 branches → project to c2
+        self.fuse = torch.nn.Sequential(
+            torch.nn.Conv2d(hidden * 5, c2, 1, bias=False),
+            torch.nn.BatchNorm2d(c2, eps=1e-3, momentum=0.03),
+            torch.nn.SiLU(inplace=True),
+        )
+
+    def forward(self, x):
+        H, W = x.shape[2], x.shape[3]
+
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        b4 = self.branch4(x)
+
+        b5 = self.global_pool(x)
+        b5 = torch.nn.functional.interpolate(
+            b5, size=(H, W), mode="bilinear", align_corners=False)
+
+        out = torch.cat([b1, b2, b3, b4, b5], dim=1)
+        return self.fuse(out)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ASPP — replaces SPPF, tuned for small-object (TB bacilli) detection
+# ═══════════════════════════════════════════════════════════════════
+
+class ASPP(torch.nn.Module):
+    """
+    Atrous Spatial Pyramid Pooling, re-tuned for small objects.
+
+    Standard DeepLab ASPP uses dilation rates 6, 12, 18 — tuned for
+    513x513 segmentation inputs with large objects. At those rates,
+    on a P5 (stride 32) feature map, the effective sampling distance
+    in original-image pixels is 192/384/576px, which is far larger
+    than a 15-30px bacillus. The conv ends up sampling background
+    noise instead of the object itself.
+
+    This version uses rates [1, 3, 5] by default (overridable),
+    keeps the rate=1 branch un-dilated for fine local detail, and
+    gives that branch more weight in the final fusion by simply
+    including it — it is the only branch with zero gridding effect.
+
+    Branches:
+      1. 1x1 conv                      (channel reduction, global mix)
+      2. 3x3 conv, dilation=rates[0]   (default 1 — plain local conv)
+      3. 3x3 conv, dilation=rates[1]   (default 3)
+      4. 3x3 conv, dilation=rates[2]   (default 5)
+      5. image pooling branch (global avg pool + 1x1 + upsample)
+    All branches projected to out_ch//5... no — projected individually
+    to out_ch_branch, concatenated, then fused with a final 1x1 conv.
+    """
+
+    def __init__(self, c1, c2, rates=(1, 3, 5)):
+        super().__init__()
+        assert len(rates) == 3, "ASPP expects exactly 3 dilation rates"
+        hidden = c2 // 4   # 4 conv branches share channel budget evenly
+
+        def _conv_bn_act(cin, cout, k, d):
+            pad = d * (k - 1) // 2
+            return torch.nn.Sequential(
+                torch.nn.Conv2d(cin, cout, k, 1, pad, dilation=d, bias=False),
+                torch.nn.BatchNorm2d(cout, eps=1e-3, momentum=0.03),
+                torch.nn.SiLU(inplace=True),
+            )
+
+        # Branch 1: 1x1, no dilation — channel mixing only
+        self.branch1 = _conv_bn_act(c1, hidden, 1, 1)
+
+        # Branches 2-4: 3x3 with configurable dilation rates
+        self.branch2 = _conv_bn_act(c1, hidden, 3, rates[0])
+        self.branch3 = _conv_bn_act(c1, hidden, 3, rates[1])
+        self.branch4 = _conv_bn_act(c1, hidden, 3, rates[2])
+
+        # Branch 5: global image pooling — coarse global context
+        self.global_pool = torch.nn.Sequential(
+            torch.nn.AdaptiveAvgPool2d(1),
+            torch.nn.Conv2d(c1, hidden, 1, bias=False),
+            torch.nn.BatchNorm2d(hidden, eps=1e-3, momentum=0.03),
+            torch.nn.SiLU(inplace=True),
+        )
+
+        # Fusion: concat all 5 branches → project to c2
+        self.fuse = torch.nn.Sequential(
+            torch.nn.Conv2d(hidden * 5, c2, 1, bias=False),
+            torch.nn.BatchNorm2d(c2, eps=1e-3, momentum=0.03),
+            torch.nn.SiLU(inplace=True),
+        )
+
+    def forward(self, x):
+        H, W = x.shape[2], x.shape[3]
+
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        b4 = self.branch4(x)
+
+        b5 = self.global_pool(x)
+        b5 = torch.nn.functional.interpolate(
+            b5, size=(H, W), mode="bilinear", align_corners=False)
+
+        out = torch.cat([b1, b2, b3, b4, b5], dim=1)
+        return self.fuse(out)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ASPP — replaces SPPF, tuned for small-object (TB bacilli) detection
+# ═══════════════════════════════════════════════════════════════════
+
+class ASPP(torch.nn.Module):
+    """
+    Atrous Spatial Pyramid Pooling, re-tuned for small objects.
+
+    Standard DeepLab ASPP uses dilation rates 6, 12, 18 — tuned for
+    513x513 segmentation inputs with large objects. At those rates,
+    on a P5 (stride 32) feature map, the effective sampling distance
+    in original-image pixels is 192/384/576px, which is far larger
+    than a 15-30px bacillus. The conv ends up sampling background
+    noise instead of the object itself.
+
+    This version uses rates [1, 3, 5] by default (overridable),
+    keeps the rate=1 branch un-dilated for fine local detail, and
+    gives that branch more weight in the final fusion by simply
+    including it — it is the only branch with zero gridding effect.
+
+    Branches:
+      1. 1x1 conv                      (channel reduction, global mix)
+      2. 3x3 conv, dilation=rates[0]   (default 1 — plain local conv)
+      3. 3x3 conv, dilation=rates[1]   (default 3)
+      4. 3x3 conv, dilation=rates[2]   (default 5)
+      5. image pooling branch (global avg pool + 1x1 + upsample)
+    All branches projected to out_ch//5... no — projected individually
+    to out_ch_branch, concatenated, then fused with a final 1x1 conv.
+    """
+
+    def __init__(self, c1, c2, rates=(1, 3, 5)):
+        super().__init__()
+        assert len(rates) == 3, "ASPP expects exactly 3 dilation rates"
+        hidden = c2 // 4   # 4 conv branches share channel budget evenly
+
+        def _conv_bn_act(cin, cout, k, d):
+            pad = d * (k - 1) // 2
+            return torch.nn.Sequential(
+                torch.nn.Conv2d(cin, cout, k, 1, pad, dilation=d, bias=False),
+                torch.nn.BatchNorm2d(cout, eps=1e-3, momentum=0.03),
+                torch.nn.SiLU(inplace=True),
+            )
+
+        # Branch 1: 1x1, no dilation — channel mixing only
+        self.branch1 = _conv_bn_act(c1, hidden, 1, 1)
+
+        # Branches 2-4: 3x3 with configurable dilation rates
+        self.branch2 = _conv_bn_act(c1, hidden, 3, rates[0])
+        self.branch3 = _conv_bn_act(c1, hidden, 3, rates[1])
+        self.branch4 = _conv_bn_act(c1, hidden, 3, rates[2])
+
+        # Branch 5: global image pooling — coarse global context
+        self.global_pool = torch.nn.Sequential(
+            torch.nn.AdaptiveAvgPool2d(1),
+            torch.nn.Conv2d(c1, hidden, 1, bias=False),
+            torch.nn.BatchNorm2d(hidden, eps=1e-3, momentum=0.03),
+            torch.nn.SiLU(inplace=True),
+        )
+
+        # Fusion: concat all 5 branches → project to c2
+        self.fuse = torch.nn.Sequential(
+            torch.nn.Conv2d(hidden * 5, c2, 1, bias=False),
+            torch.nn.BatchNorm2d(c2, eps=1e-3, momentum=0.03),
+            torch.nn.SiLU(inplace=True),
+        )
+
+    def forward(self, x):
+        H, W = x.shape[2], x.shape[3]
+
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        b4 = self.branch4(x)
+
+        b5 = self.global_pool(x)
+        b5 = torch.nn.functional.interpolate(
+            b5, size=(H, W), mode="bilinear", align_corners=False)
+
+        out = torch.cat([b1, b2, b3, b4, b5], dim=1)
+        return self.fuse(out)
+
+
+class ASPP_SOD(ASPP):
+    """
+    ASPP variant pre-configured for placement at P2/P3 (stride 4/8)
+    rather than P5. At these finer strides the effective receptive
+    field per dilation step is already large relative to bacillus
+    size, so rates are tightened further to [1, 2, 3].
+
+    Use this variant if you insert ASPP into the neck at P2 or P3
+    instead of replacing SPPF at the end of the backbone (P5).
+    """
+    def __init__(self, c1, c2):
+        super().__init__(c1, c2, rates=(1, 2, 3))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
