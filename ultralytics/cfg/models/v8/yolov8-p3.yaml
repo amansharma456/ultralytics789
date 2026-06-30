@@ -1,0 +1,58 @@
+# Ultralytics YOLOv8 + P2 Small Object Detection head
+# Backbone: stock YOLOv8 CSP/C2f (unchanged)
+# Neck: PAN-FPN extended down to P2 (stride 4)
+# Head: 4-scale Detect on P2/P3/P4/P5
+
+nc: 1   # tuberculosis bacilli
+scales:
+  # [depth, width, max_channels]
+  n: [0.33, 0.25, 1024]
+  s: [0.33, 0.50, 1024]
+  m: [0.67, 0.75,  768]
+  l: [1.00, 1.00,  512]
+  x: [1.00, 1.25,  512]
+
+# ── Backbone (stock YOLOv8, unmodified) ───────────────────────────────────
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv,  [64, 3, 2]]    # 0-P1/2
+  - [-1, 1, Conv,  [128, 3, 2]]   # 1-P2/4
+  - [-1, 3, C2f,   [128, True]]   # 2
+  - [-1, 1, Conv,  [256, 3, 2]]   # 3-P3/8
+  - [-1, 6, C2f,   [256, True]]   # 4
+  - [-1, 1, Conv,  [512, 3, 2]]   # 5-P4/16
+  - [-1, 6, C2f,   [512, True]]   # 6
+  - [-1, 1, Conv,  [1024, 3, 2]]  # 7-P5/32
+  - [-1, 3, C2f,   [1024, True]]  # 8
+  - [-1, 1, SPPF,  [1024, 5]]     # 9
+
+# ── Head: PAN-FPN extended to P2 ──────────────────────────────────────────
+head:
+  # ── top-down: P5 → P4 → P3 → P2 ─────────────────────────────────────────
+  - [-1,  1, nn.Upsample, [null, 2, "nearest"]]  # 10  up P5→P4
+  - [[-1, 6], 1, Concat,  [1]]                   # 11  cat backbone P4
+  - [-1,  3, C2f,         [512]]                 # 12  neck_P4
+
+  - [-1,  1, nn.Upsample, [null, 2, "nearest"]]  # 13  up neck_P4→P3
+  - [[-1, 4], 1, Concat,  [1]]                   # 14  cat backbone P3
+  - [-1,  3, C2f,         [256]]                 # 15  neck_P3
+
+  - [-1,  1, nn.Upsample, [null, 2, "nearest"]]  # 16  up neck_P3→P2
+  - [[-1, 2], 1, Concat,  [1]]                   # 17  cat backbone P2
+  - [-1,  3, C2f,         [128]]                 # 18  P2_out  (stride 4) ← NEW
+
+  # ── bottom-up: P2 → P3 → P4 → P5 ────────────────────────────────────────
+  - [-1,  1, Conv,        [128, 3, 2]]           # 19  down P2→P3 scale
+  - [[-1, 15], 1, Concat, [1]]                   # 20  cat neck_P3
+  - [-1,  3, C2f,         [256]]                 # 21  P3_out  (stride 8)
+
+  - [-1,  1, Conv,        [256, 3, 2]]           # 22  down P3→P4 scale
+  - [[-1, 12], 1, Concat, [1]]                   # 23  cat neck_P4
+  - [-1,  3, C2f,         [512]]                 # 24  P4_out  (stride 16)
+
+  - [-1,  1, Conv,        [512, 3, 2]]           # 25  down P4→P5 scale
+  - [[-1, 9], 1, Concat,  [1]]                   # 26  cat backbone P5(SPPF)
+  - [-1,  3, C2f,         [1024]]                # 27  P5_out  (stride 32)
+
+  # ── detection: 4 scales [P2, P3, P4, P5] ─────────────────────────────────
+  - [[18, 21, 24, 27], 1, Detect, [nc]]          # 28  Detect P2/P3/P4/P5
