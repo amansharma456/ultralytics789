@@ -2338,7 +2338,7 @@ class _WindowAttention(torch.nn.Module):
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
 
-        attn = self.softmax(attn)
+        attn = attn.to(v.dtype)
         x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
         return self.proj(x)
 
