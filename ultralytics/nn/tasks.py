@@ -2907,10 +2907,14 @@ class _SwinWindowAttention(torch.nn.Module):
                     + mask.unsqueeze(1).unsqueeze(0))
             attn = attn.view(-1, self.num_heads, N, N)
 
-        attn = self.softmax(attn)
-        attn = attn.to(v.dtype)
-        x    = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        return self.proj(x)
+attn = self.softmax(attn)
+
+# Match dtype with v when using AMP
+attn = attn.to(v.dtype)
+
+x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+
+return self.proj(x)
 
 
 class _SwinBlock(torch.nn.Module):
