@@ -2039,6 +2039,9 @@ def parse_model(d, ch, verbose=True):
         elif m is SwinBackbone:
             args = [ch[f]]          # in_chans from ch[f]
             c2   = None             # multi-output; set below after build    
+        elif m in {SPPF, ASPP, ASPP_SOD}:
+            c1, c2 = ch[f], args[0]
+            args = [c1, c2]
 
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
