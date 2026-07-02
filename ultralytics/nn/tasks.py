@@ -1937,7 +1937,6 @@ def parse_model(d, ch, verbose=True):
             Classify,
             Conv,
             ASPP,
-            ASPP_SOD,
             ConvTranspose,
             GhostConv,
             Bottleneck,
