@@ -2037,7 +2037,7 @@ def parse_model(d, ch, verbose=True):
         elif m is SwinBackbone:
             args = [ch[f]]          # in_chans from ch[f]
             c2   = None             # multi-output; set below after build    
-        elif m in {SPPF, ASPP, ASPP_SOD}:
+        elif m in {SPPF, ASPP}:
             c1, c2 = ch[f], args[0]
             args = [c1, c2]
 
