@@ -2134,7 +2134,7 @@ def parse_model(d, ch, verbose=True):
             c2 = m_.dims[-1]                  # ch[] carries deepest-stage width;
                                               # individual widths live in multi_out_ch
 
-        # After building the module, record multi-output channels and fix c2
+        # After building the module, record multi-output channels and fix c2 
         if m is ConvNeXtV2Backbone:
             multi_out_ch[i] = list(m_.dims)   # e.g. [96, 192, 384, 768] for tiny
             c2 = m_.dims[-1]                  # ch list carries the last-stage width;
