@@ -2908,12 +2908,15 @@ class _SwinWindowAttention(torch.nn.Module):
             attn = attn.view(-1, self.num_heads, N, N)
 
 attn = self.softmax(attn)
-
-# Match dtype with v when using AMP
 attn = attn.to(v.dtype)
 
-x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+print("q:", q.dtype)
+print("k:", k.dtype)
+print("v:", v.dtype)
+print("attn:", attn.dtype)
+print("rpb:", rpb.dtype)
 
+x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
 return self.proj(x)
 
 
