@@ -1,0 +1,94 @@
+# ============================================================
+#  YOLOv8-C3TR-SOD-P2
+#  Target: >= 90 mAP50 on TB / small-object microscopy data
+#
+#  All modules exist in this repo's block.py / head.py:
+#    C3TR    → block.py  (C3 + TransformerBlock)
+#    C2fPSA  → block.py  (C2f + Positional-Shift Attention)
+#    C2f     → block.py
+#    SPPF    → block.py
+#    Detect  → head.py
+#
+#  Architecture overview:
+#    Backbone : Standard YOLOv8 CSP (ImageNet-pretrained friendly)
+#               C3TR replaces the last C2f block at P5 for
+#               global context (transformer attention across slide)
+#    Neck     : Top-down FPN + bottom-up PAN
+#               C2fPSA at P3 neck captures cluster-level context
+#    SOD path : P3 → upsample → fuse P2 backbone → P2 head
+#               Fires on 3-15 px bacilli (stride 4 = 160×160 at 640)
+#    Detect   : 3 heads — P2/P3/P4 (strides 4/8/16)
+#               P5 head dropped — bacilli never fill a 32-px cell
+# ============================================================
+
+nc: 1     # number of classes  (1 = TB bacillus; change if multi-class)
+
+scales:
+  # [depth_multiple, width_multiple, max_channels]
+  n: [0.33, 0.25, 1024]   # ~3 M  params  — start here, fastest
+  s: [0.33, 0.50, 1024]   # ~11 M params  — best accuracy/speed tradeoff
+  m: [0.67, 0.75, 768]    # ~26 M params
+  l: [1.00, 1.00, 512]    # ~44 M params
+  x: [1.00, 1.25, 512]    # ~69 M params
+
+# ── Backbone ──────────────────────────────────────────────────────────────────
+backbone:
+  # [from, repeats, module, args]
+
+  # Standard YOLOv8 stem
+  - [-1, 1, Conv,  [64,   3, 2]]      # 0   P1/2   stride  2  → 320×320
+  - [-1, 1, Conv,  [128,  3, 2]]      # 1   P2/4   stride  4  → 160×160
+
+  # P2 block — kept shallow (3 bottlenecks) as SOD anchor
+  - [-1, 3, C2f,   [128, True]]       # 2   P2     160×160   ← SOD skip
+
+  - [-1, 1, Conv,  [256,  3, 2]]      # 3   P3/8   stride  8  →  80×80
+  - [-1, 6, C2f,   [256, True]]       # 4   P3      80×80
+
+  - [-1, 1, Conv,  [512,  3, 2]]      # 5   P4/16  stride 16  →  40×40
+  - [-1, 6, C2f,   [512, True]]       # 6   P4      40×40
+
+  - [-1, 1, Conv,  [1024, 3, 2]]      # 7   P5/32  stride 32  →  20×20
+
+  # C3TR: C3 with an embedded TransformerBlock
+  #   arg[0] = out_channels
+  #   arg[1] = shortcut (False lets transformer fully re-order features)
+  - [-1, 3, C3TR,  [1024, False]]     # 8   P5 + global attention  20×20
+
+  # SPPF: multi-scale context pooling
+  - [-1, 1, SPPF,  [1024, 5]]         # 9   P5 SPPF  20×20
+
+# ── Head ──────────────────────────────────────────────────────────────────────
+head:
+  # ── Top-down: P5 → P4 ────────────────────────────────────────────────────
+  - [-1,      1, nn.Upsample, [None, 2, 'nearest']]    # 10   40×40
+  - [[-1, 6], 1, Concat,      [1]]                     # 11   cat P4 backbone (ch=512+512)
+  - [-1,      3, C2f,         [512]]                   # 12   P4 neck
+
+  # ── Top-down: P4 → P3 ────────────────────────────────────────────────────
+  - [-1,      1, nn.Upsample, [None, 2, 'nearest']]    # 13   80×80
+  - [[-1, 4], 1, Concat,      [1]]                     # 14   cat P3 backbone (ch=256+256)
+
+  # C2fPSA: C2f + Positional-Shift Attention
+  #   Adds spatial attention at 80×80 — captures which grid cells
+  #   belong to the same cluster of bacilli (cluster-level context)
+  - [-1,      3, C2fPSA,      [256]]                   # 15   P3 neck  ← key upgrade
+
+  # ── SOD upsample path: P3 → P2 ───────────────────────────────────────────
+  - [-1,      1, nn.Upsample, [None, 2, 'nearest']]    # 16   160×160
+  - [[-1, 2], 1, Concat,      [1]]                     # 17   cat P2 backbone (SOD fusion)
+  - [-1,      3, C2f,         [128]]                   # 18   P2 SOD head  160×160  ← tiny bacilli
+
+  # ── Bottom-up: P2 → P3 ───────────────────────────────────────────────────
+  - [-1,       1, Conv,       [256, 3, 2]]              # 19   80×80
+  - [[-1, 15], 1, Concat,     [1]]                     # 20   cat P3 neck
+  - [-1,       3, C2f,        [256]]                   # 21   P3 head
+
+  # ── Bottom-up: P3 → P4 ───────────────────────────────────────────────────
+  - [-1,       1, Conv,       [512, 3, 2]]              # 22   40×40
+  - [[-1, 12], 1, Concat,     [1]]                     # 23   cat P4 neck
+  - [-1,       3, C2f,        [512]]                   # 24   P4 head
+
+  # ── Multi-scale detection: P2 | P3 | P4  (strides 4 / 8 / 16) ───────────
+  # Intentionally NO P5 head — bacilli are 3-15 px, never stride-32 scale
+  - [[18, 21, 24], 1, Detect, [nc]]                    # 25   output
