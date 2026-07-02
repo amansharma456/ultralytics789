@@ -30,7 +30,6 @@ from ultralytics.nn.modules import (
     SPP,
     SPPELAN,
     ASPP,
-    ASPP_SOD,
     SPPF,
     A2C2f,
     AConv,
