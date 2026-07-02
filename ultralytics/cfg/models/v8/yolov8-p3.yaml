@@ -26,33 +26,34 @@ backbone:
   - [-1, 3, C2f,   [1024, True]]  # 8
   - [-1, 1, SPPF,  [1024, 5]]     # 9
 
-# ── Head: PAN-FPN extended to P2 ──────────────────────────────────────────
+# YOLOv8.0s head
 head:
-  # ── top-down: P5 → P4 → P3 → P2 ─────────────────────────────────────────
-  - [-1,  1, nn.Upsample, [null, 2, "nearest"]]  # 10  up P5→P4
-  - [[-1, 6], 1, Concat,  [1]]                   # 11  cat backbone P4
-  - [-1,  3, C2f,         [512]]                 # 12  neck_P4
+  - [-1, 1, Conv, [512, 1, 1]]
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 6], 1, Concat, [1]]  # cat backbone P4
+  - [-1, 3, C2f, [512]]  # 13
 
-  - [-1,  1, nn.Upsample, [null, 2, "nearest"]]  # 13  up neck_P4→P3
-  - [[-1, 4], 1, Concat,  [1]]                   # 14  cat backbone P3
-  - [-1,  3, C2f,         [256]]                 # 15  neck_P3
+  - [-1, 1, Conv, [256, 1, 1]]
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 4], 1, Concat, [1]]  # cat backbone P3
+  - [-1, 3, C2f, [256]]  # 17 (P3/8-small)
 
-  - [-1,  1, nn.Upsample, [null, 2, "nearest"]]  # 16  up neck_P3→P2
-  - [[-1, 2], 1, Concat,  [1]]                   # 17  cat backbone P2
-  - [-1,  3, C2f,         [128]]                 # 18  P2_out  (stride 4) ← NEW
+  - [-1, 1, Conv, [128, 1, 1]]
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 2], 1, Concat, [1]]  # cat backbone P2
+  - [-1, 3, C2f, [128]]  # 17 (P2/4-xsmall)
 
-  # ── bottom-up: P2 → P3 → P4 → P5 ────────────────────────────────────────
-  - [-1,  1, Conv,        [128, 3, 2]]           # 19  down P2→P3 scale
-  - [[-1, 15], 1, Concat, [1]]                   # 20  cat neck_P3
-  - [-1,  3, C2f,         [256]]                 # 21  P3_out  (stride 8)
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 15, 4], 1, Concat, [1]]  # cat head P3
+  - [-1, 3, C2f, [256]]  # 20 (P3/8-small)
 
-  - [-1,  1, Conv,        [256, 3, 2]]           # 22  down P3→P4 scale
-  - [[-1, 12], 1, Concat, [1]]                   # 23  cat neck_P4
-  - [-1,  3, C2f,         [512]]                 # 24  P4_out  (stride 16)
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 12, 6], 1, Concat, [1]]  # cat head P4
+  - [-1, 3, C2f, [512]]  # 20 (P4/16-medium)
 
-  - [-1,  1, Conv,        [512, 3, 2]]           # 25  down P4→P5 scale
-  - [[-1, 9], 1, Concat,  [1]]                   # 26  cat backbone P5(SPPF)
-  - [-1,  3, C2f,         [1024]]                # 27  P5_out  (stride 32)
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 9, 8], 1, Concat, [1]]  # cat head P5
+  - [-1, 3, C2f, [1024]]  # 23 (P5/32-large)
 
-  # ── detection: 4 scales [P2, P3, P4, P5] ─────────────────────────────────
-  - [[18, 21, 24, 27], 1, Detect, [nc]]          # 28  Detect P2/P3/P4/P5
+  - [[15, 18, 21, 24], 1, Detect, [nc]]  # Detect(P3, P4, P5)
+
