@@ -1945,7 +1945,7 @@ def parse_model(d, ch, verbose=True):
             C2PSA,
             DWConv,
             Focus,
-            BottleneckCSP,
+            BottleneckCSP, 
             C1,
             C2,
             C2f,
