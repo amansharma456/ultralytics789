@@ -2829,7 +2829,299 @@ class ASPP_SOD(ASPP):
     """
     def __init__(self, c1, c2):
         super().__init__(c1, c2, rates=(1, 2, 3))
+# ═══════════════════════════════════════════════════════════════════
+# Swin Transformer Backbone
+# Defined directly in tasks.py to avoid import caching issues
+# ═══════════════════════════════════════════════════════════════════
 
+def _swin_window_partition(x, window_size):
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size,
+                W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+    windows = windows.view(-1, window_size, window_size, C)
+    return windows
+
+
+def _swin_window_reverse(windows, window_size, H, W):
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size,
+                     window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
+
+
+class _SwinWindowAttention(torch.nn.Module):
+    def __init__(self, dim, window_size, num_heads):
+        super().__init__()
+        self.dim         = dim
+        self.window_size = window_size
+        self.num_heads   = num_heads
+        self.scale       = (dim // num_heads) ** -0.5
+
+        self.relative_position_bias_table = torch.nn.Parameter(
+            torch.zeros((2 * window_size - 1) * (2 * window_size - 1),
+                        num_heads))
+
+        coords_h = torch.arange(window_size)
+        coords_w = torch.arange(window_size)
+        coords   = torch.stack(
+            torch.meshgrid([coords_h, coords_w], indexing="ij"))
+        coords_flatten  = torch.flatten(coords, 1)
+        relative_coords = (coords_flatten[:, :, None]
+                           - coords_flatten[:, None, :])
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        relative_coords[:, :, 0] += window_size - 1
+        relative_coords[:, :, 1] += window_size - 1
+        relative_coords[:, :, 0] *= 2 * window_size - 1
+        relative_position_index = relative_coords.sum(-1)
+        self.register_buffer("relative_position_index",
+                             relative_position_index)
+
+        self.qkv     = torch.nn.Linear(dim, dim * 3, bias=True)
+        self.proj    = torch.nn.Linear(dim, dim)
+        self.softmax = torch.nn.Softmax(dim=-1)
+
+        torch.nn.init.trunc_normal_(
+            self.relative_position_bias_table, std=0.02)
+
+    def forward(self, x, mask=None):
+        B_, N, C = x.shape
+        qkv = (self.qkv(x)
+               .reshape(B_, N, 3, self.num_heads, C // self.num_heads)
+               .permute(2, 0, 3, 1, 4))
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q   = q * self.scale
+        attn = q @ k.transpose(-2, -1)
+
+        rpb = self.relative_position_bias_table[
+            self.relative_position_index.view(-1)].view(
+            self.window_size * self.window_size,
+            self.window_size * self.window_size, -1)
+        rpb  = rpb.permute(2, 0, 1).contiguous()
+        attn = attn + rpb.unsqueeze(0)
+
+        if mask is not None:
+            nW   = mask.shape[0]
+            attn = (attn.view(B_ // nW, nW, self.num_heads, N, N)
+                    + mask.unsqueeze(1).unsqueeze(0))
+            attn = attn.view(-1, self.num_heads, N, N)
+
+        attn = self.softmax(attn)
+        x    = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        return self.proj(x)
+
+
+class _SwinBlock(torch.nn.Module):
+    def __init__(self, dim, num_heads, window_size,
+                 shift_size, drop_path_rate):
+        super().__init__()
+        self.dim         = dim
+        self.window_size = window_size
+        self.shift_size  = shift_size
+        self.norm1       = torch.nn.LayerNorm(dim)
+        self.norm2       = torch.nn.LayerNorm(dim)
+        self.attn        = _SwinWindowAttention(dim, window_size, num_heads)
+        self.mlp         = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim * 4),
+            torch.nn.GELU(),
+            torch.nn.Linear(dim * 4, dim),
+        )
+        self.dp_rate = drop_path_rate
+
+    def _drop_path(self, x):
+        if not self.training or self.dp_rate == 0.0:
+            return x
+        keep  = 1.0 - self.dp_rate
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        rand  = (torch.rand(shape, device=x.device, dtype=x.dtype)
+                 .floor_().add_(keep))
+        return x * rand / keep
+
+    def _compute_mask(self, H, W, device):
+        if self.shift_size == 0:
+            return None
+        img_mask = torch.zeros((1, H, W, 1), device=device)
+        h_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        w_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        cnt = 0
+        for h in h_slices:
+            for w in w_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
+        mask_windows = _swin_window_partition(
+            img_mask, self.window_size).view(
+            -1, self.window_size * self.window_size)
+        attn_mask = (mask_windows.unsqueeze(1)
+                     - mask_windows.unsqueeze(2))
+        attn_mask = attn_mask.masked_fill(
+            attn_mask != 0, -100.0).masked_fill(
+            attn_mask == 0,   0.0)
+        return attn_mask
+
+    def forward(self, x, H, W):
+        B, L, C = x.shape
+        shortcut = x
+        x = self.norm1(x).view(B, H, W, C)
+
+        # pad to multiple of window_size
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        if pad_b > 0 or pad_r > 0:
+            x = torch.nn.functional.pad(x, (0, 0, 0, pad_r, 0, pad_b))
+        Hp, Wp = H + pad_b, W + pad_r
+
+        # cyclic shift
+        if self.shift_size > 0:
+            x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size),
+                           dims=(1, 2))
+
+        # window partition → attention → reverse
+        windows     = _swin_window_partition(x, self.window_size)
+        windows     = windows.view(-1, self.window_size * self.window_size, C)
+        mask        = self._compute_mask(Hp, Wp, x.device)
+        attn_out    = self.attn(windows, mask=mask)
+        attn_out    = attn_out.view(-1, self.window_size, self.window_size, C)
+        x           = _swin_window_reverse(attn_out, self.window_size, Hp, Wp)
+
+        # reverse cyclic shift
+        if self.shift_size > 0:
+            x = torch.roll(x, shifts=(self.shift_size, self.shift_size),
+                           dims=(1, 2))
+
+        # remove padding
+        if pad_b > 0 or pad_r > 0:
+            x = x[:, :H, :W, :].contiguous()
+
+        x = x.view(B, H * W, C)
+        x = shortcut + self._drop_path(x)
+        x = x + self._drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+class _SwinPatchMerging(torch.nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.norm      = torch.nn.LayerNorm(4 * dim)
+        self.reduction = torch.nn.Linear(4 * dim, 2 * dim, bias=False)
+
+    def forward(self, x, H, W):
+        B, L, C = x.shape
+        x  = x.view(B, H, W, C)
+        # pad if H or W is odd
+        if H % 2 != 0 or W % 2 != 0:
+            x = torch.nn.functional.pad(x, (0, 0, 0, W % 2, 0, H % 2))
+        x0 = x[:, 0::2, 0::2, :]
+        x1 = x[:, 1::2, 0::2, :]
+        x2 = x[:, 0::2, 1::2, :]
+        x3 = x[:, 1::2, 1::2, :]
+        x  = torch.cat([x0, x1, x2, x3], -1).view(B, -1, 4 * C)
+        return self.reduction(self.norm(x))
+
+
+class SwinBackbone(torch.nn.Module):
+    """
+    Swin Transformer Tiny backbone for YOLOv8.
+
+    Config (Swin-T):
+      depths     = [2, 2, 6, 2]
+      dims       = [96, 192, 384, 768]
+      num_heads  = [3, 6, 12, 24]
+      window_size = 7
+
+    Returns [P2, P3, P4, P5] as (B, C, H, W) tensors.
+    Channel widths [96, 192, 384, 768] match neck expectations.
+    """
+
+    _DIMS      = [96, 192, 384, 768]
+    _DEPTHS    = [2, 2, 6, 2]
+    _HEADS     = [3, 6, 12, 24]
+    _WINDOW    = 7
+
+    def __init__(self, in_chans=3, drop_path_rate=0.1):
+        super().__init__()
+        dims, depths, heads, ws = (self._DIMS, self._DEPTHS,
+                                   self._HEADS, self._WINDOW)
+        self.dims = list(dims)
+
+        # patch embed: 4×4 conv stride 4 → P2 resolution
+        self.patch_embed = torch.nn.Conv2d(
+            in_chans, dims[0], kernel_size=4, stride=4)
+        self.patch_norm  = torch.nn.LayerNorm(dims[0])
+
+        total = sum(depths)
+        dpr   = torch.linspace(0, drop_path_rate, total).tolist()
+        cur   = 0
+
+        self.stages    = torch.nn.ModuleList()
+        self.merges    = torch.nn.ModuleList()
+        self.out_norms = torch.nn.ModuleList(
+            [torch.nn.LayerNorm(d) for d in dims])
+
+        for i in range(4):
+            # patch merging before stages 1,2,3 (not stage 0)
+            if i > 0:
+                self.merges.append(_SwinPatchMerging(dims[i - 1]))
+            else:
+                self.merges.append(torch.nn.Identity())
+
+            stage = torch.nn.ModuleList([
+                _SwinBlock(
+                    dim        = dims[i],
+                    num_heads  = heads[i],
+                    window_size= ws,
+                    shift_size = 0 if b % 2 == 0 else ws // 2,
+                    drop_path_rate = dpr[cur + b]
+                )
+                for b in range(depths[i])
+            ])
+            self.stages.append(stage)
+            cur += depths[i]
+
+        # weight init
+        for m in self.modules():
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
+            elif isinstance(m, torch.nn.LayerNorm):
+                torch.nn.init.zeros_(m.bias)
+                torch.nn.init.ones_(m.weight)
+            elif isinstance(m, torch.nn.Conv2d):
+                torch.nn.init.kaiming_normal_(
+                    m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        B      = x.shape[0]
+        x      = self.patch_embed(x)        # (B, 96, H/4, W/4)
+        _, C, H, W = x.shape
+        x      = x.flatten(2).transpose(1, 2)   # (B, H*W, C)
+        x      = self.patch_norm(x)
+
+        outs = []
+        for i in range(4):
+            # merge patches (downsample) before stages 1,2,3
+            if i > 0:
+                x = self.merges[i](x, H, W)
+                H, W = H // 2, W // 2
+
+            # run all blocks in this stage
+            for blk in self.stages[i]:
+                x = blk(x, H, W)
+
+            # convert tokens → spatial feature map and save
+            x_out = self.out_norms[i](x)
+            x_out = x_out.transpose(1, 2).reshape(
+                B, self.dims[i], H, W)
+            outs.append(x_out)
+
+        return outs   # [P2_96, P3_192, P4_384, P5_768]
 
 
 
