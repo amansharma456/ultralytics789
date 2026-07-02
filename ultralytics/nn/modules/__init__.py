@@ -28,6 +28,7 @@ from .block import (
     DFL,
     ELAN1,
     PSA,
+    ASPP,
     SPP,
     SPPELAN,
     SPPF,
