@@ -2905,10 +2905,7 @@ class _SEBlock(torch.nn.Module):
 
 
 class _MBConv(torch.nn.Module):
-    """
-    Mobile Inverted Bottleneck Conv (MBConv) block.
-    expand_ratio=1 skips expansion (used in stage 0).
-    """
+  
     def __init__(self, in_ch, out_ch, kernel_size,
                  stride, expand_ratio, se_ratio=0.25,
                  drop_path_rate=0.0):
