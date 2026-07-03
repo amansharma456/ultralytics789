@@ -2034,7 +2034,7 @@ def parse_model(d, ch, verbose=True):
         elif m is AIFI:
             args = [ch[f], *args]
 
-        elif m is SwinBackbone , EfficientNetB0Backbone:
+        elif m is SwinBackbone:
             args = [ch[f]]          # in_chans from ch[f]
             c2   = None             # multi-output; set below after build    
         elif m in {SPPF, ASPP}:
@@ -2142,7 +2142,7 @@ def parse_model(d, ch, verbose=True):
             multi_out_ch[i] = list(m_.dims)   # e.g. [96, 192, 384, 768] for tiny
             c2 = m_.dims[-1]                  # ch list carries the last-stage width;
                                               # individual stage widths live in multi_out_ch
-        if m is SwinBackbone , EfficientNetB0Backbone:
+        if m is SwinBackbone:
             multi_out_ch[i] = list(m_.dims)
             c2 = m_.dims[-1]
         if verbose:
