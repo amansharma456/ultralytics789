@@ -2961,7 +2961,7 @@ class _MBConv(torch.nn.Module):
 
 
 class EfficientNetB0Backbone(torch.nn.Module):
-    """
+    
     EfficientNet-B0 backbone adapted for YOLOv8 multi-scale detection.
 
     Extracts features at 4 scales matching SOD requirement:
@@ -2979,7 +2979,6 @@ class EfficientNetB0Backbone(torch.nn.Module):
           4   |   3    |   5    |   1    |   80  |   112  |   6   → P4
           5   |   4    |   5    |   2    |   112 |   192  |   6
           6   |   1    |   3    |   1    |   192 |   320  |   6   → P5
-    """
 
     # (repeat, kernel, stride, in_ch, out_ch, expand_ratio)
     _STAGE_CFG = [
