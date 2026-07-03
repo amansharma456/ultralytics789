@@ -2102,7 +2102,7 @@ class ASPP(torch.nn.Module):
     to out_ch_branch, concatenated, then fused with a final 1x1 conv.
     """
 
-    def __init__(self, c1, c2, rates=(1, 3, 5)):
+    def __init__(self, c1, c2, rates=(1, 2, 3)):
         super().__init__()
         assert len(rates) == 3, "ASPP expects exactly 3 dilation rates"
         hidden = c2 // 4   # 4 conv branches share channel budget evenly
