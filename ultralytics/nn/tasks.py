@@ -2927,7 +2927,7 @@ class _BiFPNBlock(torch.nn.Module):
             self._dw_sep(num_channels) for _ in range(total_nodes)
         ])
 
-        self.relu = torch.nn.ReLU()
+ 
 
     @staticmethod
     def _dw_sep(ch):
