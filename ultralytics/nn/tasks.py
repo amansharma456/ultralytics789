@@ -2097,6 +2097,13 @@ def parse_model(d, ch, verbose=True):
 
         elif m is CBFuse:
             c2 = ch[f[-1]]
+
+        elif m is BiFPN:
+            in_channels  = [ch[x] for x in f]
+            num_channels = args[0] if len(args) > 0 else 256
+            num_repeats  = args[1] if len(args) > 1 else 3
+            args         = [in_channels, num_channels, num_repeats]
+            c2           = num_channels
         elif m is FNOBackbone:
             # YAML args are empty []; in_chans is injected automatically from ch[f].
             # dims and modes use the class defaults (optimum values baked in).
@@ -2142,9 +2149,15 @@ def parse_model(d, ch, verbose=True):
             multi_out_ch[i] = list(m_.dims)   # e.g. [96, 192, 384, 768] for tiny
             c2 = m_.dims[-1]                  # ch list carries the last-stage width;
                                               # individual stage widths live in multi_out_ch
-        if m is SwinBackbone:
+        if m in (SwinBackbone, EfficientNetB0Backbone):
             multi_out_ch[i] = list(m_.dims)
             c2 = m_.dims[-1]
+
+        if m is BiFPN:
+            num_ch     = m.num_channels
+            num_levels = len(m.laterals)
+            multi_out_ch[i] = [num_ch] * num_levels
+            c2 = num_ch
         if verbose:
             LOGGER.info(f"{i:>3}{f!s:>20}{n_:>3}{m_.np:10.0f}  {t:<45}{args!s:<30}")
 
