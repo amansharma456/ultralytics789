@@ -2939,10 +2939,10 @@ class _BiFPNBlock(torch.nn.Module):
         )
 
     def _fuse(self, feats, weights):
-        w   = self.relu(weights)
+        w   = torch.nn.functional.relu(weights.clone())
         w   = w / (w.sum() + self.eps)
         return sum(w[i] * feats[i] for i in range(len(feats)))
-
+     
     def forward(self, features):
         n  = self.num_levels
         P  = list(features)
