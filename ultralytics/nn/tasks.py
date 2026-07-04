@@ -2155,8 +2155,8 @@ def parse_model(d, ch, verbose=True):
             c2 = m_.dims[-1]
 
         if m is BiFPN:
-            num_ch     = m.num_channels
-            num_levels = len(m.laterals)
+            num_ch = m_.num_channels
+            num_levels = len(m_.laterals)
             multi_out_ch[i] = [num_ch] * num_levels
             c2 = num_ch
         if verbose:
