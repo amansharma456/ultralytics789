@@ -2150,7 +2150,7 @@ def parse_model(d, ch, verbose=True):
             multi_out_ch[i] = list(m_.dims)   # e.g. [96, 192, 384, 768] for tiny
             c2 = m_.dims[-1]                  # ch list carries the last-stage width;
                                               # individual stage widths live in multi_out_ch
-        if m in (SwinBackbone,):
+        if m is SwinBackbone:
             multi_out_ch[i] = list(m_.dims)
             c2 = m_.dims[-1]
 
