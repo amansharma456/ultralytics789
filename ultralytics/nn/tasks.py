@@ -2876,7 +2876,141 @@ class SwinBackbone(torch.nn.Module):
             outs.append(x_out)
 
         return outs   # [P2_96, P3_192, P4_384, P5_768]
+# ═══════════════════════════════════════════════════════════════════
+# BiFPN — Bidirectional Feature Pyramid Network
+# ═══════════════════════════════════════════════════════════════════
 
+class _BiFPNBlock(torch.nn.Module):
+    """
+    Single BiFPN layer operating on N feature scales.
+    Weighted bidirectional feature fusion with fast normalised weights.
+    """
+
+    def __init__(self, num_channels=256, num_levels=4, eps=1e-4):
+        super().__init__()
+        self.num_levels = num_levels
+        self.eps        = eps
+
+        # top-down fusion weights: one per level except the deepest
+        self.w_td = torch.nn.ParameterList([
+            torch.nn.Parameter(torch.ones(2))
+            for _ in range(num_levels - 1)
+        ])
+
+        # bottom-up fusion weights: 3 inputs per intermediate node
+        self.w_bu = torch.nn.ParameterList([
+            torch.nn.Parameter(torch.ones(3))
+            for _ in range(num_levels - 1)
+        ])
+
+        # shallowest bottom-up node only has 2 inputs
+        self.w_bu_bottom = torch.nn.Parameter(torch.ones(2))
+
+        # depthwise-separable conv for each fused node
+        # (num_levels-1) top-down nodes + num_levels bottom-up nodes
+        total_nodes = (num_levels - 1) + num_levels
+        self.convs  = torch.nn.ModuleList([
+            self._dw_sep(num_channels) for _ in range(total_nodes)
+        ])
+
+        self.relu = torch.nn.ReLU()
+
+    @staticmethod
+    def _dw_sep(ch):
+        return torch.nn.Sequential(
+            torch.nn.Conv2d(ch, ch, 3, 1, 1, groups=ch, bias=False),
+            torch.nn.Conv2d(ch, ch, 1, bias=False),
+            torch.nn.BatchNorm2d(ch, eps=1e-3, momentum=0.03),
+            torch.nn.SiLU(inplace=True),
+        )
+
+    def _fuse(self, feats, weights):
+        w   = self.relu(weights)
+        w   = w / (w.sum() + self.eps)
+        return sum(w[i] * feats[i] for i in range(len(feats)))
+
+    def forward(self, features):
+        n  = self.num_levels
+        P  = list(features)
+        td = [None] * n
+
+        # top-down: deepest → shallowest
+        td[n - 1] = P[n - 1]
+        for i in range(n - 2, -1, -1):
+            up     = torch.nn.functional.interpolate(
+                td[i + 1], size=P[i].shape[2:], mode="nearest")
+            fused  = self._fuse([P[i], up], self.w_td[i])
+            td[i]  = self.convs[n - 2 - i](fused)
+
+        # bottom-up: shallowest → deepest
+        out    = [None] * n
+        out[0] = self.convs[n - 1](
+            self._fuse([P[0], td[0]], self.w_bu_bottom))
+
+        for i in range(1, n):
+            down   = torch.nn.functional.max_pool2d(
+                out[i - 1], kernel_size=2, stride=2)
+            fused  = self._fuse([P[i], td[i], down], self.w_bu[i - 1])
+            out[i] = self.convs[n + i - 1](fused)
+
+        return out
+
+
+class BiFPN(torch.nn.Module):
+    """
+    BiFPN neck: lateral channel adapters + repeated BiFPN blocks.
+
+    Args:
+        in_channels  : list of input channel counts per scale
+        num_channels : unified internal channel width (default 256)
+        num_repeats  : number of stacked BiFPN blocks (default 3)
+
+    Forward input  : list of feature tensors [P3, P4, P5, P6]
+    Forward output : list of fused tensors   [P3, P4, P5, P6]
+                     all at num_channels width
+    """
+
+    def __init__(self, in_channels, num_channels=256, num_repeats=3):
+        super().__init__()
+        self.num_channels = num_channels
+        num_levels        = len(in_channels)
+
+        # lateral 1x1 projections to unified width
+        self.laterals = torch.nn.ModuleList([
+            torch.nn.Sequential(
+                torch.nn.Conv2d(c, num_channels, 1, bias=False),
+                torch.nn.BatchNorm2d(num_channels, eps=1e-3, momentum=0.03),
+                torch.nn.SiLU(inplace=True),
+            )
+            for c in in_channels
+        ])
+
+        # stacked BiFPN blocks
+        self.blocks = torch.nn.ModuleList([
+            _BiFPNBlock(num_channels, num_levels)
+            for _ in range(num_repeats)
+        ])
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, torch.nn.Conv2d):
+                torch.nn.init.kaiming_normal_(
+                    m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
+            elif isinstance(m, torch.nn.BatchNorm2d):
+                torch.nn.init.ones_(m.weight)
+                torch.nn.init.zeros_(m.bias)
+
+    def forward(self, features):
+        adapted = [self.laterals[i](features[i])
+                   for i in range(len(features))]
+        fused = adapted
+        for block in self.blocks:
+            fused = block(fused)
+        return fused
 
 
 
