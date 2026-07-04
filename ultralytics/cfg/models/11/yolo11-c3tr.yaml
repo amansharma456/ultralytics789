@@ -1,0 +1,55 @@
+# YOLO11 + C3TR at P5 stage
+# Backbone: stock YOLO11 with C3TR replacing C3k2 at deepest stage
+# Neck: standard PAN-FPN extended to P2 (SOD — 4 scale inputs)
+# Head: single Detect on [P2, P3, P4, P5]
+
+nc: 1
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00,  512]
+  l: [1.00, 1.00,  512]
+  x: [1.00, 1.50,  512]
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv,   [64, 3, 2]]            # 0   P1  stride 2
+  - [-1, 1, Conv,   [128, 3, 2]]           # 1   P2  stride 4
+  - [-1, 2, C3k2,   [256, False, 0.25]]    # 2   P2 stage
+  - [-1, 1, Conv,   [256, 3, 2]]           # 3   stride 8
+  - [-1, 2, C3k2,   [512, False, 0.25]]    # 4   P3 out  stride 8
+  - [-1, 1, Conv,   [512, 3, 2]]           # 5   stride 16
+  - [-1, 2, C3k2,   [512, True]]           # 6   P4 out  stride 16
+  - [-1, 1, Conv,   [1024, 3, 2]]          # 7   stride 32
+  - [-1, 2, C3TR,   [1024]]               # 8   C3TR at P5 — replaces C3k2
+  - [-1, 1, SPPF,   [1024, 5]]            # 9   SPPF
+
+head:
+  # ── top-down: P5 → P4 → P3 → P2 ─────────────────────────────────
+  - [-1,  1, nn.Upsample,  [null, 2, "nearest"]]  # 10  up P5
+  - [[6, -1], 1, Concat,   [1]]                   # 11  cat P4+up(P5)
+  - [-1,  2, C3k2,         [512, False]]           # 12  neck_P4
+
+  - [-1,  1, nn.Upsample,  [null, 2, "nearest"]]  # 13  up neck_P4
+  - [[4, -1], 1, Concat,   [1]]                   # 14  cat P3+up
+  - [-1,  2, C3k2,         [256, False]]           # 15  neck_P3
+
+  - [-1,  1, nn.Upsample,  [null, 2, "nearest"]]  # 16  up neck_P3
+  - [[2, -1], 1, Concat,   [1]]                   # 17  cat P2+up
+  - [-1,  2, C3k2,         [128, False]]           # 18  P2_out stride 4
+
+  # ── bottom-up: P2 → P3 → P4 → P5 ────────────────────────────────
+  - [-1,  1, Conv,         [128, 3, 2]]            # 19  down P2→P3
+  - [[15, -1], 1, Concat,  [1]]                   # 20  cat neck_P3
+  - [-1,  2, C3k2,         [256, False]]           # 21  P3_out stride 8
+
+  - [-1,  1, Conv,         [256, 3, 2]]            # 22  down P3→P4
+  - [[12, -1], 1, Concat,  [1]]                   # 23  cat neck_P4
+  - [-1,  2, C3k2,         [512, False]]           # 24  P4_out stride 16
+
+  - [-1,  1, Conv,         [512, 3, 2]]            # 25  down P4→P5
+  - [[9, -1], 1, Concat,   [1]]                   # 26  cat SPPF
+  - [-1,  2, C3k2,         [1024, True]]           # 27  P5_out stride 32
+
+  # ── single Detect, 4 inputs [P2,P3,P4,P5] = SOD ──────────────────
+  - [[18, 21, 24, 27], 1, Detect, [nc]]            # 28  Detect
