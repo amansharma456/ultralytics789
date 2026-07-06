@@ -1,6 +1,6 @@
 # Ultralytics YOLO11 + C3TR + P2 Small Object Detection (SOD)
 
-nc: 80
+nc: 1
 
 scales:
   # [depth, width, max_channels]
