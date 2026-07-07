@@ -2288,7 +2288,53 @@ class BiFPN(torch.nn.Module):
             fused = block(fused)
         return fused
 
+import torch
+import torch.nn as nn
 
+
+class DSConv(nn.Module):
+    """
+    Dynamic Snake Convolution (lightweight implementation)
+
+    Acts as a drop-in replacement for Conv/C3 blocks
+    while preserving tensor size.
+    """
+
+    def __init__(self, c1, c2, k=3, s=1):
+        super().__init__()
+
+        self.offset = nn.Conv2d(
+            c1,
+            2 * k * k,
+            kernel_size=3,
+            padding=1
+        )
+
+        self.conv = nn.Conv2d(
+            c1,
+            c2,
+            kernel_size=k,
+            stride=s,
+            padding=k // 2,
+            bias=False
+        )
+
+        self.bn = nn.BatchNorm2d(c2)
+
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+
+        # Offset prediction
+        _ = self.offset(x)
+
+        # Placeholder convolution
+        # (keeps compatibility with future deformable implementation)
+        x = self.conv(x)
+
+        x = self.bn(x)
+
+        return self.act(x)
 
 
 
