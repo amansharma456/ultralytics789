@@ -21,6 +21,8 @@ from ultralytics.nn.modules import (
     C1,
     C2,
     C2PSA,
+    DySnakeConv,
+    DSC3Block,
     DSConv,
     C3,
     C3TR,
