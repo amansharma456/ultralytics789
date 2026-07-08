@@ -2100,7 +2100,22 @@ def parse_model(d, ch, verbose=True):
 
         elif m is CBFuse:
             c2 = ch[f[-1]]
+         
+        elif m is DySnakeConv:
+            c1, c2 = ch[f], args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2]
 
+        elif m is DSC3Block:
+            c1, c2 = ch[f], args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
+            if len(args) >= 3:
+                args.insert(2, n)
+                n = 1
+             
         elif m is BiFPN:
             in_channels  = [ch[x] for x in f]
             num_channels = args[0] if len(args) > 0 else 256
