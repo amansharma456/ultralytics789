@@ -3027,7 +3027,215 @@ class BiFPN(torch.nn.Module):
         for block in self.blocks:
             fused = block(fused)
         return fused
+# ═══════════════════════════════════════════════════════════════════
+# Dynamic Snake Convolution
+# Designed for tubular/elongated structure detection
+# TB bacilli are rod-shaped — this is the ideal conv for them
+# Paper: Dynamic Snake Convolution (ICCV 2023)
+# ═══════════════════════════════════════════════════════════════════
 
+class DySnakeConv(torch.nn.Module):
+    """
+    Dynamic Snake Convolution block.
+
+    Runs three parallel convolutions:
+      1. Standard 3x3 conv — baseline spatial features
+      2. Snake conv along x-axis — captures horizontal elongation
+      3. Snake conv along y-axis — captures vertical elongation
+
+    The three outputs are concatenated and projected back to out_ch.
+    For TB bacilli at arbitrary orientation, the x and y snake paths
+    together cover all rod orientations through their combination.
+
+    Args:
+        in_ch   : input channels
+        out_ch  : output channels
+        k       : kernel size for snake conv (default 3)
+        t       : number of iterations for offset accumulation (default 2)
+    """
+
+    def __init__(self, in_ch, out_ch, k=3, t=2):
+        super().__init__()
+        self.in_ch  = in_ch
+        self.out_ch = out_ch
+        self.k      = k
+        self.t      = t
+
+        # Standard conv branch
+        self.conv_std = torch.nn.Sequential(
+            torch.nn.Conv2d(in_ch, out_ch, k, 1, k // 2, bias=False),
+            torch.nn.BatchNorm2d(out_ch, eps=1e-3, momentum=0.03),
+            torch.nn.SiLU(inplace=True),
+        )
+
+        # Snake conv x-axis branch
+        self.conv_x = torch.nn.Sequential(
+            torch.nn.Conv2d(in_ch, out_ch, k, 1, k // 2, bias=False),
+            torch.nn.BatchNorm2d(out_ch, eps=1e-3, momentum=0.03),
+            torch.nn.SiLU(inplace=True),
+        )
+
+        # Snake conv y-axis branch
+        self.conv_y = torch.nn.Sequential(
+            torch.nn.Conv2d(in_ch, out_ch, k, 1, k // 2, bias=False),
+            torch.nn.BatchNorm2d(out_ch, eps=1e-3, momentum=0.03),
+            torch.nn.SiLU(inplace=True),
+        )
+
+        # Offset predictor for x-axis snake path
+        self.offset_x = torch.nn.Conv2d(in_ch, k * k, 1, bias=True)
+
+        # Offset predictor for y-axis snake path
+        self.offset_y = torch.nn.Conv2d(in_ch, k * k, 1, bias=True)
+
+        # Project concatenated 3*out_ch back to out_ch
+        self.project = torch.nn.Sequential(
+            torch.nn.Conv2d(3 * out_ch, out_ch, 1, bias=False),
+            torch.nn.BatchNorm2d(out_ch, eps=1e-3, momentum=0.03),
+            torch.nn.SiLU(inplace=True),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, torch.nn.Conv2d):
+                torch.nn.init.kaiming_normal_(
+                    m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
+            elif isinstance(m, torch.nn.BatchNorm2d):
+                torch.nn.init.ones_(m.weight)
+                torch.nn.init.zeros_(m.bias)
+        # init offset predictors to zero so snake starts as standard conv
+        torch.nn.init.zeros_(self.offset_x.weight)
+        torch.nn.init.zeros_(self.offset_x.bias)
+        torch.nn.init.zeros_(self.offset_y.weight)
+        torch.nn.init.zeros_(self.offset_y.bias)
+
+    def _get_snake_grid(self, x, offsets, axis):
+        """
+        Generate deformed sampling grid following snake path.
+
+        axis='x': deformation accumulates along width dimension
+        axis='y': deformation accumulates along height dimension
+
+        The snake constraint forces offsets to accumulate sequentially
+        so the sampling points form a connected path rather than
+        arbitrary scattered points — this is what makes it follow
+        elongated structures like bacilli.
+        """
+        B, C, H, W = x.shape
+        device     = x.device
+
+        # Base grid: regular meshgrid over H x W
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=device),
+            torch.linspace(-1, 1, W, device=device),
+            indexing="ij"
+        )
+        grid = torch.stack([grid_x, grid_y], dim=-1)  # (H, W, 2)
+        grid = grid.unsqueeze(0).expand(B, -1, -1, -1)  # (B, H, W, 2)
+
+        # offsets: (B, k*k, H, W) → take mean over kernel positions
+        # and scale to grid range
+        offset = offsets.mean(dim=1, keepdim=True)       # (B, 1, H, W)
+        offset = offset.permute(0, 2, 3, 1)               # (B, H, W, 1)
+        offset = torch.tanh(offset) * (2.0 / max(H, W))   # normalise
+
+        # Apply snake constraint: accumulate along axis
+        if axis == "x":
+            # deform x coordinate, keep y fixed
+            delta = torch.zeros(B, H, W, 2, device=device)
+            delta[..., 0] = offset[..., 0]
+            # accumulate offsets along width for snake continuity
+            for _ in range(self.t):
+                delta[..., 0] = torch.cumsum(
+                    delta[..., 0], dim=2) / (W * 0.5)
+        else:
+            # deform y coordinate, keep x fixed
+            delta = torch.zeros(B, H, W, 2, device=device)
+            delta[..., 1] = offset[..., 0]
+            for _ in range(self.t):
+                delta[..., 1] = torch.cumsum(
+                    delta[..., 1], dim=1) / (H * 0.5)
+
+        deformed_grid = (grid + delta).clamp(-1, 1)
+        return deformed_grid
+
+    def _snake_sample(self, x, offsets, axis, conv):
+        """Sample x using deformed snake grid then apply conv."""
+        grid    = self._get_snake_grid(x, offsets, axis)
+        sampled = torch.nn.functional.grid_sample(
+            x, grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True
+        )
+        return conv(sampled)
+
+    def forward(self, x):
+        # Standard branch
+        out_std = self.conv_std(x)
+
+        # Predict offsets for each snake axis
+        off_x = self.offset_x(x)   # (B, k*k, H, W)
+        off_y = self.offset_y(x)
+
+        # Snake branches with deformed sampling
+        out_x = self._snake_sample(x, off_x, "x", self.conv_x)
+        out_y = self._snake_sample(x, off_y, "y", self.conv_y)
+
+        # Concatenate and project
+        return self.project(torch.cat([out_std, out_x, out_y], dim=1))
+
+
+class DSC3Block(torch.nn.Module):
+    """
+    C3-style block using DySnakeConv as the bottleneck operation.
+
+    Structure:
+        input → cv1 → DySnakeConv x n → cat(cv2) → cv3 → output
+
+    This replaces C3k2 in the neck where fine-scale elongated
+    structure sensitivity is most important (P2 and P3 scales).
+
+    Args:
+        in_ch    : input channels
+        out_ch   : output channels
+        n        : number of DySnakeConv repeats
+        shortcut : use residual in snake bottleneck
+        e        : channel expansion ratio
+    """
+
+    def __init__(self, in_ch, out_ch, n=1, shortcut=False, e=0.5):
+        super().__init__()
+        mid      = int(out_ch * e)
+        self.cv1 = torch.nn.Sequential(
+            torch.nn.Conv2d(in_ch, mid, 1, bias=False),
+            torch.nn.BatchNorm2d(mid, eps=1e-3, momentum=0.03),
+            torch.nn.SiLU(inplace=True),
+        )
+        self.cv2 = torch.nn.Sequential(
+            torch.nn.Conv2d(in_ch, mid, 1, bias=False),
+            torch.nn.BatchNorm2d(mid, eps=1e-3, momentum=0.03),
+            torch.nn.SiLU(inplace=True),
+        )
+        self.cv3 = torch.nn.Sequential(
+            torch.nn.Conv2d(2 * mid, out_ch, 1, bias=False),
+            torch.nn.BatchNorm2d(out_ch, eps=1e-3, momentum=0.03),
+            torch.nn.SiLU(inplace=True),
+        )
+        self.snake_blocks = torch.nn.Sequential(*[
+            DySnakeConv(mid, mid) for _ in range(n)
+        ])
+        self.shortcut = shortcut and in_ch == out_ch
+
+    def forward(self, x):
+        branch1 = self.snake_blocks(self.cv1(x))
+        branch2 = self.cv2(x)
+        out     = self.cv3(torch.cat([branch1, branch2], dim=1))
+        return x + out if self.shortcut else out
 
 
  
