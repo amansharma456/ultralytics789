@@ -1939,6 +1939,8 @@ def parse_model(d, ch, verbose=True):
             Classify,
             Conv,
             ASPP,
+            DySnakeConv,
+            DSC3Block,
             ConvTranspose,
             GhostConv,
             Bottleneck,
