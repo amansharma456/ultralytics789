@@ -2096,7 +2096,7 @@ def parse_model(d, ch, verbose=True):
         elif m is CBLinear:
             c2 = args[0]
             c1 = ch[f]
-            args = [c1, c2, *args[1:]]
+            args = [c1, c2, *args[1:]] 
 
         elif m is CBFuse:
             c2 = ch[f[-1]]
