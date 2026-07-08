@@ -2335,7 +2335,148 @@ class DSConv(nn.Module):
         x = self.bn(x)
 
         return self.act(x)
+# ═══════════════════════════════════════════════════════════════════
+# Dynamic Snake Convolution
+# ═══════════════════════════════════════════════════════════════════
 
+class DySnakeConv(nn.Module):
+    """
+    Dynamic Snake Convolution block.
+    Three parallel paths:
+      1. Standard 3x3 conv
+      2. Snake conv along x-axis (horizontal elongation)
+      3. Snake conv along y-axis (vertical elongation)
+    Designed for tubular/rod-shaped structures like TB bacilli.
+    """
+
+    def __init__(self, in_ch, out_ch, k=3, t=2):
+        super().__init__()
+        self.in_ch  = in_ch
+        self.out_ch = out_ch
+        self.k      = k
+        self.t      = t
+
+        self.conv_std = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, k, 1, k // 2, bias=False),
+            nn.BatchNorm2d(out_ch, eps=1e-3, momentum=0.03),
+            nn.SiLU(inplace=True),
+        )
+        self.conv_x = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, k, 1, k // 2, bias=False),
+            nn.BatchNorm2d(out_ch, eps=1e-3, momentum=0.03),
+            nn.SiLU(inplace=True),
+        )
+        self.conv_y = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, k, 1, k // 2, bias=False),
+            nn.BatchNorm2d(out_ch, eps=1e-3, momentum=0.03),
+            nn.SiLU(inplace=True),
+        )
+        self.offset_x = nn.Conv2d(in_ch, k * k, 1, bias=True)
+        self.offset_y = nn.Conv2d(in_ch, k * k, 1, bias=True)
+        self.project  = nn.Sequential(
+            nn.Conv2d(3 * out_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch, eps=1e-3, momentum=0.03),
+            nn.SiLU(inplace=True),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+        nn.init.zeros_(self.offset_x.weight)
+        nn.init.zeros_(self.offset_x.bias)
+        nn.init.zeros_(self.offset_y.weight)
+        nn.init.zeros_(self.offset_y.bias)
+
+    def _get_snake_grid(self, x, offsets, axis):
+        B, C, H, W = x.shape
+        device     = x.device
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=device),
+            torch.linspace(-1, 1, W, device=device),
+            indexing="ij"
+        )
+        grid   = torch.stack([grid_x, grid_y], dim=-1)
+        grid   = grid.unsqueeze(0).expand(B, -1, -1, -1)
+        offset = offsets.mean(dim=1, keepdim=True)
+        offset = offset.permute(0, 2, 3, 1)
+        offset = torch.tanh(offset) * (2.0 / max(H, W))
+
+        if axis == "x":
+            delta = torch.zeros(B, H, W, 2, device=device)
+            delta[..., 0] = offset[..., 0]
+            for _ in range(self.t):
+                delta[..., 0] = torch.cumsum(
+                    delta[..., 0], dim=2) / (W * 0.5)
+        else:
+            delta = torch.zeros(B, H, W, 2, device=device)
+            delta[..., 1] = offset[..., 0]
+            for _ in range(self.t):
+                delta[..., 1] = torch.cumsum(
+                    delta[..., 1], dim=1) / (H * 0.5)
+
+        return (grid + delta).clamp(-1, 1)
+
+    def _snake_sample(self, x, offsets, axis, conv):
+        grid    = self._get_snake_grid(x, offsets, axis)
+        sampled = F.grid_sample(
+            x, grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True
+        )
+        return conv(sampled)
+
+    def forward(self, x):
+        out_std = self.conv_std(x)
+        off_x   = self.offset_x(x)
+        off_y   = self.offset_y(x)
+        out_x   = self._snake_sample(x, off_x, "x", self.conv_x)
+        out_y   = self._snake_sample(x, off_y, "y", self.conv_y)
+        return self.project(torch.cat([out_std, out_x, out_y], dim=1))
+
+
+class DSC3Block(nn.Module):
+    """
+    C3-style block using DySnakeConv as the bottleneck.
+    Replaces C3k2 in neck at P2 and P3 scales.
+    """
+
+    def __init__(self, in_ch, out_ch, n=1, shortcut=False, e=0.5):
+        super().__init__()
+        mid           = int(out_ch * e)
+        self.cv1      = nn.Sequential(
+            nn.Conv2d(in_ch, mid, 1, bias=False),
+            nn.BatchNorm2d(mid, eps=1e-3, momentum=0.03),
+            nn.SiLU(inplace=True),
+        )
+        self.cv2      = nn.Sequential(
+            nn.Conv2d(in_ch, mid, 1, bias=False),
+            nn.BatchNorm2d(mid, eps=1e-3, momentum=0.03),
+            nn.SiLU(inplace=True),
+        )
+        self.cv3      = nn.Sequential(
+            nn.Conv2d(2 * mid, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch, eps=1e-3, momentum=0.03),
+            nn.SiLU(inplace=True),
+        )
+        self.snake_blocks = nn.Sequential(*[
+            DySnakeConv(mid, mid) for _ in range(n)
+        ])
+        self.shortcut = shortcut and in_ch == out_ch
+
+    def forward(self, x):
+        b1  = self.snake_blocks(self.cv1(x))
+        b2  = self.cv2(x)
+        out = self.cv3(torch.cat([b1, b2], dim=1))
+        return x + out if self.shortcut else out
 
 
 
